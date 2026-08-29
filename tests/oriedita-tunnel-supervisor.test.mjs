@@ -81,7 +81,7 @@ test("publishes one shared tunnel document to every runtime registry", async () 
   }
 });
 
-test("installed services keep legacy design mode and publish a rate-limited shared runtime", async () => {
+test("installed services use fresh one-action Codex mode and publish a rate-limited shared runtime", async () => {
   const [tunnelService, localService] = await Promise.all([
     readFile(new URL("../scripts/local-oriedita-tunnel-service.mjs", import.meta.url), "utf8"),
     readFile(new URL("../scripts/local-oriedita-service.mjs", import.meta.url), "utf8"),
@@ -90,7 +90,7 @@ test("installed services keep legacy design mode and publish a rate-limited shar
   assert.match(tunnelService, /ORI_AI_TUNNEL_REGISTRY_REPO<\/key><string>yuka-718\/oriai-stepwise/);
   assert.match(tunnelService, /ORI_AI_TUNNEL_REGISTRY_MIRROR_REPOS<\/key><string>yuka-718\/oriai/);
   assert.match(tunnelService, /ORI_AI_TUNNEL_PROVIDER<\/key><string>cloudflare<\/string>/);
-  assert.match(localService, /ORI_AI_DESIGN_MODE<\/key>\s*<string>codex_mcp_loop<\/string>/);
+  assert.match(localService, /ORI_AI_DESIGN_MODE<\/key>\s*<string>codex_mcp_stepwise<\/string>/);
   assert.match(localService, /ORI_AI_MAX_JOBS_PER_WINDOW<\/key>\s*<string>3<\/string>/);
   assert.match(localService, /ORI_AI_RATE_WINDOW_MS<\/key>\s*<string>21600000<\/string>/);
   assert.match(localService, /ProcessType<\/key>\s*<string>Interactive<\/string>/);

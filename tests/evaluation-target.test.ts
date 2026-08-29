@@ -22,6 +22,11 @@ test("the public result gate opens only at an evaluated appearance score of 99",
   }), false);
   assert.equal(hasReachedAppearanceTarget({
     mode: "codex_oriedita_mcp_loop",
+    targetScore: 99,
+    appearance: { score: 100 },
+  }), false);
+  assert.equal(hasReachedAppearanceTarget({
+    mode: "codex_oriedita_mcp_stepwise",
     targetScore: 98,
     appearance: { score: 99 },
   }), false);
@@ -29,7 +34,7 @@ test("the public result gate opens only at an evaluated appearance score of 99",
 });
 
 test("the appearance subscore is authoritative when present", () => {
-  const evidence = (appearanceScore: number, mode = "codex_oriedita_mcp_loop") => ({
+  const evidence = (appearanceScore: number, mode = "codex_oriedita_mcp_stepwise") => ({
     mode,
     targetScore: 99,
     score: 100,
@@ -39,6 +44,7 @@ test("the appearance subscore is authoritative when present", () => {
   assert.equal(hasReachedAppearanceTarget(evidence(98)), false);
   assert.equal(hasReachedAppearanceTarget(evidence(99)), true);
   assert.equal(hasReachedAppearanceTarget(evidence(100)), true);
-  assert.equal(hasReachedAppearanceTarget(evidence(99, "codex_oriedita_mcp_stepwise")), true);
+  assert.equal(evaluatedAppearanceScore(evidence(99, "codex_oriedita_mcp_loop")), null);
+  assert.equal(hasReachedAppearanceTarget(evidence(99, "codex_oriedita_mcp_loop")), false);
   assert.equal(hasReachedAppearanceTarget(evidence(99, "unknown_mode")), false);
 });

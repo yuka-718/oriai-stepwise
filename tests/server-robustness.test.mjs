@@ -20,6 +20,7 @@ const {
   codexServiceMetadata,
   createCodexOperationSummary,
   createJobAdmissionGate,
+  fingerprintDesignRequest,
   isCodexDesignMode,
   loadCommittedCodexActionKeys,
   loadPersistedCodexActionHistory,
@@ -28,11 +29,13 @@ const {
   publicJob,
   restorePersistedJobs,
   resolveDesignModeSelection,
+  runIdempotentJobCreation,
   runCodexBatchesUntilTarget,
   runOrieditaModifiabilitySmokeTest,
   searchedStructuralPatternCount,
   server,
   terminateStaleCodexProcessLease,
+  validateIdempotencyKey,
 } = await import("../local-oriedita/server.mjs?server-robustness-test");
 
 if (!server.listening) await once(server, "listening");
@@ -120,6 +123,291 @@ test("failed job creation releases its admission reservation", async () => {
   assert.equal(gate.reservations, 0);
 });
 
+test("UUID idempotency keys are normalized and malformed keys are rejected", () => {
+  assert.equal(validateIdempotencyKey(null), null);
+  assert.equal(
+    validateIdempotencyKey(" 11111111-1111-4111-8111-AAAAAAAAAAAA "),
+    "11111111-1111-4111-8111-aaaaaaaaaaaa",
+  );
+  assert.throws(
+    () => validateIdempotencyKey("not-a-uuid"),
+    (error) => error?.status === 400 && /UUID/.test(error.message),
+  );
+});
+
+test("design request fingerprints are stable across object ordering and include binary input", () => {
+  const first = fingerprintDesignRequest({
+    prompt: "鶴",
+    goal: { symmetry: true, parts: ["wing", "tail"] },
+    referenceImage: { mimeType: "image/png", bytes: Buffer.from("image") },
+  });
+  const reordered = fingerprintDesignRequest({
+    referenceImage: { bytes: new Uint8Array(Buffer.from("image")), mimeType: "image/png" },
+    goal: { parts: ["wing", "tail"], symmetry: true },
+    prompt: "鶴",
+  });
+  assert.match(first, /^[0-9a-f]{64}$/);
+  assert.equal(reordered, first);
+  assert.notEqual(fingerprintDesignRequest({ prompt: "亀" }), first);
+});
+
+test("concurrent submissions with one idempotency key create exactly one job", async () => {
+  const gate = createJobAdmissionGate({
+    queueList: [],
+    isActive: () => false,
+    maxWaitingJobs: 3,
+  });
+  const jobsMap = new Map();
+  const idempotencyMap = new Map();
+  const inflightMap = new Map();
+  let createCount = 0;
+  let quotaCount = 0;
+  let releaseCreation;
+  const creationBarrier = new Promise((resolve) => {
+    releaseCreation = resolve;
+  });
+  const options = {
+    idempotencyKey: "11111111-1111-4111-8111-111111111111",
+    requestFingerprint: "a".repeat(64),
+    gate,
+    jobsMap,
+    idempotencyMap,
+    inflightMap,
+    beforeCreate: () => {
+      quotaCount += 1;
+    },
+    create: async () => {
+      createCount += 1;
+      await creationBarrier;
+      const job = { id: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa" };
+      jobsMap.set(job.id, job);
+      return job;
+    },
+  };
+
+  const submissions = Array.from({ length: 8 }, () => runIdempotentJobCreation(options));
+  releaseCreation();
+  const results = await Promise.all(submissions);
+
+  assert.equal(createCount, 1);
+  assert.equal(quotaCount, 1);
+  assert.equal(gate.reservations, 0);
+  assert.ok(results.every(({ job }) => job.id === "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"));
+  assert.equal(results.filter(({ created }) => created).length, 1);
+});
+
+test("an in-flight idempotency key rejects a different request fingerprint", async () => {
+  const gate = createJobAdmissionGate({ queueList: [], isActive: () => false });
+  const jobsMap = new Map();
+  const idempotencyMap = new Map();
+  const inflightMap = new Map();
+  let releaseCreation;
+  const creationBarrier = new Promise((resolve) => {
+    releaseCreation = resolve;
+  });
+  const base = {
+    idempotencyKey: "22222222-2222-4222-8222-222222222222",
+    requestFingerprint: "a".repeat(64),
+    gate,
+    jobsMap,
+    idempotencyMap,
+    inflightMap,
+    create: async () => {
+      await creationBarrier;
+      const job = { id: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" };
+      jobsMap.set(job.id, job);
+      return job;
+    },
+  };
+  const original = runIdempotentJobCreation(base);
+  await assert.rejects(
+    runIdempotentJobCreation({ ...base, requestFingerprint: "b".repeat(64) }),
+    (error) => error?.status === 409,
+  );
+  releaseCreation();
+  assert.equal((await original).created, true);
+});
+
+test("clients without an idempotency key retain create-on-every-request behavior", async () => {
+  const gate = createJobAdmissionGate({
+    queueList: [],
+    isActive: () => false,
+    maxWaitingJobs: 3,
+  });
+  let createCount = 0;
+  const createLegacy = () => runIdempotentJobCreation({
+    idempotencyKey: null,
+    gate,
+    jobsMap: new Map(),
+    idempotencyMap: new Map(),
+    inflightMap: new Map(),
+    create: async () => ({ id: `legacy-${++createCount}` }),
+  });
+
+  const first = await createLegacy();
+  const second = await createLegacy();
+  assert.equal(first.created, true);
+  assert.equal(second.created, true);
+  assert.equal(createCount, 2);
+  assert.notEqual(first.job.id, second.job.id);
+});
+
+test("CORS permits Idempotency-Key and the jobs endpoint rejects a malformed key", async () => {
+  const address = server.address();
+  assert.ok(address && typeof address !== "string");
+  const origin = `http://${address.address}:${address.port}`;
+  const preflight = await fetch(`${origin}/jobs`, {
+    method: "OPTIONS",
+    headers: { Origin: "https://yuka-718.github.io" },
+  });
+  assert.equal(preflight.status, 204);
+  assert.match(preflight.headers.get("access-control-allow-headers") ?? "", /\bIdempotency-Key\b/i);
+
+  const malformed = await fetch(`${origin}/jobs`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Idempotency-Key": "not-a-uuid",
+    },
+    body: "{}",
+  });
+  assert.equal(malformed.status, 400);
+  assert.match((await malformed.json()).error, /UUID/);
+});
+
+test("the HTTP jobs endpoint returns the original job only for the same fingerprint", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oriai-http-idempotency-"));
+  try {
+    const id = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const key = "44444444-4444-4444-8444-444444444444";
+    const directory = join(root, id);
+    const fold = {
+      file_spec: 1.2,
+      vertices_coords: [[0, 0], [1, 0], [1, 1], [0, 1]],
+      edges_vertices: [[0, 1], [1, 2], [2, 3], [3, 0], [0, 2]],
+      edges_assignment: ["B", "B", "B", "B", "V"],
+    };
+    const body = { designMode: "codex_mcp_stepwise", prompt: "鶴", fold };
+    const requestFingerprint = fingerprintDesignRequest({
+      prompt: "鶴",
+      fold,
+      candidates: [fold],
+      goal: null,
+      referenceImage: null,
+      pipeline: null,
+      designMode: "codex_mcp_stepwise",
+    });
+    await mkdir(directory, { recursive: true });
+    await persistJobState({
+      id,
+      type: "design",
+      directory,
+      designMode: "codex_mcp_stepwise",
+      idempotencyKey: key,
+      requestFingerprint,
+      status: "done",
+      message: "完了",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      startedAt: "2026-01-01T00:00:01.000Z",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      result: {},
+      error: null,
+      cancelRequested: false,
+    });
+    await restorePersistedJobs({ root, queueList: [] });
+
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const origin = `http://${address.address}:${address.port}`;
+    const headers = { "Content-Type": "application/json", "Idempotency-Key": key };
+    const repeated = await fetch(`${origin}/jobs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(body),
+    });
+    assert.equal(repeated.status, 200);
+    assert.equal((await repeated.json()).job.id, id);
+
+    const conflicting = await fetch(`${origin}/jobs`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ ...body, prompt: "亀" }),
+    });
+    assert.equal(conflicting.status, 409);
+    assert.match((await conflicting.json()).error, /異なる生成内容/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("the HTTP jobs endpoint rejects legacy loop mode and defaults new requests to stepwise", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oriai-http-stepwise-default-"));
+  try {
+    const id = "99999999-9999-4999-8999-999999999999";
+    const key = "55555555-5555-4555-8555-555555555555";
+    const directory = join(root, id);
+    const fold = {
+      file_spec: 1.2,
+      vertices_coords: [[0, 0], [1, 0], [1, 1], [0, 1]],
+      edges_vertices: [[0, 1], [1, 2], [2, 3], [3, 0], [0, 2]],
+      edges_assignment: ["B", "B", "B", "B", "V"],
+    };
+    const body = { prompt: "鶴", fold };
+    const requestFingerprint = fingerprintDesignRequest({
+      prompt: "鶴",
+      fold,
+      candidates: [fold],
+      goal: null,
+      referenceImage: null,
+      pipeline: null,
+      designMode: null,
+    });
+    await mkdir(directory, { recursive: true });
+    await persistJobState({
+      id,
+      type: "design",
+      directory,
+      designMode: "codex_mcp_stepwise",
+      idempotencyKey: key,
+      requestFingerprint,
+      status: "done",
+      message: "完了",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      startedAt: "2026-01-01T00:00:01.000Z",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      result: {},
+      error: null,
+      cancelRequested: false,
+    });
+    await restorePersistedJobs({ root, queueList: [] });
+
+    const address = server.address();
+    assert.ok(address && typeof address !== "string");
+    const origin = `http://${address.address}:${address.port}`;
+    const legacy = await fetch(`${origin}/jobs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...body, designMode: "codex_mcp_loop" }),
+    });
+    assert.equal(legacy.status, 400);
+    assert.match((await legacy.json()).error, /未対応の設計モード/);
+
+    const defaulted = await fetch(`${origin}/jobs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": key },
+      body: JSON.stringify(body),
+    });
+    assert.equal(defaulted.status, 200);
+    const payload = await defaulted.json();
+    assert.equal(payload.job.id, id);
+    assert.equal(payload.job.progress.mode, "codex_mcp_stepwise");
+    assert.equal(payload.job.progress.batchSize, 1);
+    assert.equal(payload.job.progress.codexExecution.freshContextPerEvaluation, true);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 function completedCodexBatch(score, iterationOffset, target = 99, batchSize = 10) {
   return {
     score,
@@ -148,13 +436,14 @@ function completedCodexBatch(score, iterationOffset, target = 99, batchSize = 10
   };
 }
 
-test("design jobs keep the legacy ten-step default and can request isolated one-step mode", () => {
-  const legacy = resolveDesignModeSelection({ defaultMode: "codex_mcp_loop" });
-  assert.deepEqual(legacy, {
-    mode: "codex_mcp_loop",
-    batchSize: 10,
+test("new design jobs default to isolated one-step mode and reject explicit legacy loop requests", () => {
+  const defaultSelection = resolveDesignModeSelection({ defaultMode: "codex_mcp_loop" });
+  assert.deepEqual(defaultSelection, {
+    mode: "codex_mcp_stepwise",
+    batchSize: 1,
     unlimitedCodexMode: true,
   });
+  assert.deepEqual(resolveDesignModeSelection(), defaultSelection);
   const stepwise = resolveDesignModeSelection({
     defaultMode: "codex_mcp_loop",
     requestedMode: "codex_mcp_stepwise",
@@ -165,8 +454,14 @@ test("design jobs keep the legacy ten-step default and can request isolated one-
     unlimitedCodexMode: true,
   });
   assert.equal(isCodexDesignMode(stepwise.mode), true);
+  // Internal recognition remains for persisted legacy-job recovery only.
+  assert.equal(isCodexDesignMode("codex_mcp_loop"), true);
   assert.equal(codexBatchSizeForMode("codex_mcp_loop"), 10);
   assert.equal(codexBatchSizeForMode("codex_mcp_stepwise"), 1);
+  assert.throws(
+    () => resolveDesignModeSelection({ requestedMode: "codex_mcp_loop" }),
+    (error) => error?.status === 400,
+  );
   assert.throws(
     () => resolveDesignModeSelection({ requestedMode: "untrusted_mode" }),
     (error) => error?.status === 400,
@@ -193,7 +488,10 @@ test("stepwise Codex metadata truthfully declares fresh context and cumulative 2
   assert.equal(legacy.batchSize, 10);
   assert.equal(legacy.freshContextPerEvaluation, false);
   const service = codexServiceMetadata("codex_mcp_loop");
-  assert.deepEqual(service.supportedModes, ["codex_mcp_loop", "codex_mcp_stepwise"]);
+  assert.deepEqual(service.supportedModes, ["codex_mcp_stepwise"]);
+  assert.equal(service.defaultMode, "codex_mcp_stepwise");
+  assert.deepEqual(Object.keys(service.modes), ["codex_mcp_stepwise"]);
+  assert.equal(service.active.batchSize, 1);
   assert.equal(service.modes.codex_mcp_stepwise.batchSize, 1);
   const stepwiseService = codexServiceMetadata("codex_mcp_stepwise");
   assert.equal(stepwiseService.active.batchSize, 1);
@@ -371,6 +669,74 @@ test("running persisted jobs are requeued after an API restart", async () => {
     assert.equal(restoredJobs.get(id).status, "queued");
     assert.match(restoredJobs.get(id).message, /再開/);
     assert.deepEqual(restoredQueue, [id]);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("restart recovery restores the persisted idempotency key to the original job", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oriai-idempotency-recovery-"));
+  try {
+    const id = "dddddddd-dddd-4ddd-8ddd-dddddddddddd";
+    const key = "33333333-3333-4333-8333-333333333333";
+    const requestFingerprint = "c".repeat(64);
+    const directory = join(root, id);
+    await mkdir(directory, { recursive: true });
+    await persistJobState({
+      id,
+      type: "design",
+      directory,
+      designMode: "codex_mcp_stepwise",
+      idempotencyKey: key,
+      requestFingerprint,
+      status: "done",
+      message: "完了",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      startedAt: "2026-01-01T00:00:01.000Z",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      result: {},
+      error: null,
+      cancelRequested: false,
+    });
+    const restoredJobs = new Map();
+    const restoredQueue = [];
+    const idempotencyMap = new Map();
+    await restorePersistedJobs({
+      root,
+      jobsMap: restoredJobs,
+      queueList: restoredQueue,
+      idempotencyMap,
+    });
+    assert.deepEqual(idempotencyMap.get(key), { jobId: id, requestFingerprint });
+
+    let created = false;
+    const result = await runIdempotentJobCreation({
+      idempotencyKey: key,
+      requestFingerprint,
+      gate: createJobAdmissionGate({ queueList: [], isActive: () => false }),
+      jobsMap: restoredJobs,
+      idempotencyMap,
+      inflightMap: new Map(),
+      create: async () => {
+        created = true;
+        return { id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee" };
+      },
+    });
+    assert.equal(created, false);
+    assert.equal(result.created, false);
+    assert.equal(result.job.id, id);
+    await assert.rejects(
+      runIdempotentJobCreation({
+        idempotencyKey: key,
+        requestFingerprint: "d".repeat(64),
+        gate: createJobAdmissionGate({ queueList: [], isActive: () => false }),
+        jobsMap: restoredJobs,
+        idempotencyMap,
+        inflightMap: new Map(),
+        create: async () => ({ id: "ffffffff-ffff-4fff-8fff-ffffffffffff" }),
+      }),
+      (error) => error?.status === 409,
+    );
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -785,11 +1151,13 @@ test("health advertises a 99 target and no job-level evaluation limit", async ()
   assert.equal(payload.result.targetScore, 99);
   assert.equal(payload.result.evaluationLimit, null);
   assert.equal(payload.result.maxIterations, null);
-  assert.equal(payload.result.batchIterations, 10);
-  assert.equal(payload.result.scheduling.policy, "round_robin_per_codex_batch");
+  assert.equal(payload.result.batchIterations, 1);
+  assert.equal(payload.result.scheduling.policy, "round_robin_per_fresh_codex_evaluation");
   assert.equal(payload.result.scheduling.restartRecovery, true);
-  assert.deepEqual(payload.result.codex.supportedModes, ["codex_mcp_loop", "codex_mcp_stepwise"]);
-  assert.equal(payload.result.codex.active.batchSize, 10);
+  assert.equal(payload.result.designMode, "codex_mcp_stepwise");
+  assert.deepEqual(payload.result.codex.supportedModes, ["codex_mcp_stepwise"]);
+  assert.deepEqual(Object.keys(payload.result.codex.modes), ["codex_mcp_stepwise"]);
+  assert.equal(payload.result.codex.active.batchSize, 1);
   assert.equal(payload.result.codex.modes.codex_mcp_stepwise.batchSize, 1);
   assert.equal(payload.result.codex.modes.codex_mcp_stepwise.freshContextPerEvaluation, true);
   assert.equal(payload.result.codex.modes.codex_mcp_stepwise.sequentialPhysicalFolding, false);

@@ -90,7 +90,7 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
     <key>ORI_AI_GROQ_MODEL</key>
     <string>qwen/qwen3.6-27b</string>
     <key>ORI_AI_DESIGN_MODE</key>
-    <string>codex_mcp_loop</string>
+    <string>codex_mcp_stepwise</string>
     <key>ORI_AI_CODEX_PATH</key>
     <string>${xml(codex)}</string>
     <key>ORI_AI_CODEX_REASONING_EFFORT</key>

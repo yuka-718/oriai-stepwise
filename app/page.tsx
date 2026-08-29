@@ -4,9 +4,22 @@ import { useEffect, useState, type ChangeEvent, type FormEvent } from "react";
 
 import OrigamiSimulator3D from "./OrigamiSimulator3D";
 import {
+  fetchWithTimeout,
+  LocalizedRequestError,
+} from "./fetch-with-timeout";
+import {
   hasReachedAppearanceTarget,
   TARGET_APPEARANCE_SCORE,
 } from "./evaluation-target";
+import {
+  createSubmissionSignature,
+  imageSubmissionIdentity,
+  readPendingSubmission,
+  reuseOrCreatePendingSubmission,
+  shouldDiscardPendingForImageSelection,
+  writePendingSubmission,
+  type PendingSubmission,
+} from "./submission-idempotency";
 import {
   createCOrigamiFinalState,
   foldFromDataUrl,
@@ -23,9 +36,10 @@ import {
 
 const API_DISCOVERY_URL = process.env.NEXT_PUBLIC_ORIEDITA_DISCOVERY_URL?.trim()
   || "https://raw.githubusercontent.com/yuka-718/oriai-stepwise/refs/heads/runtime/oriedita-upstream.json";
-const API_RECONNECT_WINDOW_MS = 330_000;
+const API_RECONNECT_WINDOW_MS = 600_000;
 const API_RECONNECT_DELAY_MS = 2_000;
 const API_REQUEST_TIMEOUT_MS = 8_000;
+const API_JOB_POST_TIMEOUT_MS = 30_000;
 const ACTIVE_JOB_STORAGE_KEY = "oriai-stepwise:active-codex-job:v1";
 const STEPWISE_DESIGN_MODE = "codex_mcp_stepwise" as const;
 let cachedApiOrigin = "";
@@ -92,6 +106,8 @@ type LocalJob = {
   progress?: JobProgress | null;
 };
 
+type ErrorTarget = "prompt" | "upload" | "form";
+
 function fileToDataUrl(file: File) {
   return new Promise<string>((resolve, reject) => {
     const reader = new FileReader();
@@ -109,7 +125,7 @@ async function resolveApiOrigin(force = false) {
   }
   const discovery = new URL(API_DISCOVERY_URL);
   discovery.searchParams.set("refresh", String(Date.now()));
-  const response = await fetchWithTimeout(discovery, {
+  const response = await fetchReadWithTimeout(discovery, {
     cache: "no-store",
     headers: { Accept: "application/vnd.github.raw+json" },
   });
@@ -124,14 +140,12 @@ async function resolveApiOrigin(force = false) {
 
 const delay = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
 
-async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit) {
-  const controller = new AbortController();
-  const timer = window.setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
-  try {
-    return await fetch(input, { ...init, signal: controller.signal });
-  } finally {
-    window.clearTimeout(timer);
-  }
+function fetchReadWithTimeout(input: RequestInfo | URL, init?: RequestInit) {
+  return fetchWithTimeout(input, init, {
+    timeoutMs: API_REQUEST_TIMEOUT_MS,
+    timeoutMessage: "生成サーバーから8秒以内に応答がありませんでした",
+    abortMessage: "生成サーバーとの通信が中止されました",
+  });
 }
 
 function readStoredActiveJob() {
@@ -172,7 +186,7 @@ async function waitForApiOrigin() {
   for (let attempt = 0; Date.now() < deadline; attempt += 1) {
     try {
       const origin = await resolveApiOrigin(attempt > 0);
-      const response = await fetchWithTimeout(`${origin}/health`, { mode: "cors", cache: "no-store" });
+      const response = await fetchReadWithTimeout(`${origin}/health`, { mode: "cors", cache: "no-store" });
       if (response.ok) return origin;
       lastError = new Error("生成サーバーが再接続中です");
     } catch (error) {
@@ -194,9 +208,18 @@ async function apiFetch(path: string, init?: RequestInit) {
   if ((init?.method ?? "GET").toUpperCase() === "POST") {
     const origin = await waitForApiOrigin();
     try {
-      return await fetch(`${origin}${path}`, { ...init, mode: "cors", cache: "no-store" });
-    } catch {
+      return await fetchWithTimeout(`${origin}${path}`, {
+        ...init,
+        mode: "cors",
+        cache: "no-store",
+      }, {
+        timeoutMs: API_JOB_POST_TIMEOUT_MS,
+        timeoutMessage: "生成開始の応答が30秒以内に届きませんでした。自動再送はしていません。少し待ってからもう一度お試しください",
+        abortMessage: "生成開始の通信が中止されました。自動再送はしていません",
+      });
+    } catch (error) {
       cachedApiOrigin = "";
+      if (error instanceof LocalizedRequestError) throw error;
       throw new Error("生成サーバーとの通信が切れました。もう一度お試しください");
     }
   }
@@ -205,7 +228,7 @@ async function apiFetch(path: string, init?: RequestInit) {
   for (let attempt = 0; attempt < 6; attempt += 1) {
     try {
       const origin = await resolveApiOrigin(attempt > 0);
-      const response = await fetchWithTimeout(`${origin}${path}`, { ...init, mode: "cors", cache: "no-store" });
+      const response = await fetchReadWithTimeout(`${origin}${path}`, { ...init, mode: "cors", cache: "no-store" });
       if (response.status >= 500 && attempt < 5) {
         cachedApiOrigin = "";
         await delay(1_000);
@@ -264,10 +287,12 @@ export default function Home() {
   const [result, setResult] = useState<DisplayResult | null>(null);
   const [activeStageId, setActiveStageId] = useState<FinalStateStageId>("angle-preview");
   const [runState, setRunState] = useState<"idle" | "running" | "error">("idle");
+  const [errorTarget, setErrorTarget] = useState<ErrorTarget | null>(null);
   const [message, setMessage] = useState("");
   const [progress, setProgress] = useState<JobProgress | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
+  const [pendingSubmission, setPendingSubmission] = useState<PendingSubmission | null>(null);
 
   useEffect(() => () => {
     if (image?.url) URL.revokeObjectURL(image.url);
@@ -284,7 +309,16 @@ export default function Home() {
 
   useEffect(() => {
     const stored = readStoredActiveJob();
-    if (!stored) return;
+    if (!stored) {
+      const pending = readPendingSubmission(window.localStorage);
+      if (!pending) return;
+      const pendingRestoreTimer = window.setTimeout(() => {
+        setPendingSubmission(pending);
+        setPrompt(pending.prompt);
+      }, 0);
+      return () => window.clearTimeout(pendingRestoreTimer);
+    }
+    writePendingSubmission(window.localStorage, null);
     const controller = new AbortController();
     const resumeTimer = window.setTimeout(() => {
       setPrompt(stored.description);
@@ -292,6 +326,7 @@ export default function Home() {
       setElapsedSeconds(Math.max(0, Math.floor((Date.now() - stored.startedAt) / 1_000)));
       setRunStartedAt(stored.startedAt);
       setRunState("running");
+      setErrorTarget(null);
       setMessage(`${TARGET_APPEARANCE_SCORE}%一致までCodexとOrieditaで評価中`);
       setProgress({
         step: 0,
@@ -306,12 +341,14 @@ export default function Home() {
         if (controller.signal.aborted) return;
         setResult(createDisplayResult(completed, stored.description));
         setRunState("idle");
+        setErrorTarget(null);
         setRunStartedAt(null);
         setMessage("生成が完了しました");
         writeStoredActiveJob(null);
       }).catch((error) => {
         if (controller.signal.aborted) return;
         setRunState("error");
+        setErrorTarget("form");
         setRunStartedAt(null);
         setMessage(error instanceof Error ? error.message : "生成できませんでした");
         writeStoredActiveJob(null);
@@ -327,13 +364,23 @@ export default function Home() {
     setResult(null);
     setActiveStageId("angle-preview");
     setRunState("idle");
+    setErrorTarget(null);
     setRunStartedAt(null);
     setMessage("");
     setProgress(null);
   }
 
+  function discardPendingSubmission() {
+    setPendingSubmission(null);
+    writePendingSubmission(window.localStorage, null);
+  }
+
   function handlePrompt(event: ChangeEvent<HTMLTextAreaElement>) {
-    setPrompt(event.target.value);
+    const nextPrompt = event.target.value;
+    if (pendingSubmission && nextPrompt !== pendingSubmission.prompt) {
+      discardPendingSubmission();
+    }
+    setPrompt(nextPrompt);
     if (result || runState === "error") resetResult();
   }
 
@@ -342,8 +389,12 @@ export default function Home() {
     if (!file) return;
     if (!file.type.startsWith("image/")) {
       setRunState("error");
+      setErrorTarget("upload");
       setMessage("画像ファイルを選んでください");
       return;
+    }
+    if (shouldDiscardPendingForImageSelection(pendingSubmission, file)) {
+      discardPendingSubmission();
     }
     setImage({ file, name: file.name, url: URL.createObjectURL(file) });
     resetResult();
@@ -355,6 +406,7 @@ export default function Home() {
     const description = prompt.trim() || image?.name.replace(/\.[^.]+$/, "").trim() || "";
     if (!description) {
       setRunState("error");
+      setErrorTarget("prompt");
       setMessage("つくりたい折り紙を入力するか、画像を追加してください");
       return;
     }
@@ -364,6 +416,7 @@ export default function Home() {
     const startedAt = Date.now();
     setRunStartedAt(startedAt);
     setRunState("running");
+    setErrorTarget(null);
     setMessage(`${TARGET_APPEARANCE_SCORE}%一致までCodexとOrieditaで評価中`);
     setProgress({
       step: 0,
@@ -386,38 +439,57 @@ export default function Home() {
         JSON.parse(candidateToFold(candidate, description)) as FoldDocument
       );
       const primaryFold = candidates[0];
+      const referenceImage = image ? await fileToDataUrl(image.file) : null;
+      const requestBody = JSON.stringify({
+        designMode: STEPWISE_DESIGN_MODE,
+        prompt: description,
+        referenceImage,
+        fold: primaryFold,
+        candidates,
+        goal: {
+          presetKey: analysis.presetKey,
+          symmetry: true,
+          parts: analysis.parts.map(({ label, importance, direction }) => ({ label, importance, direction })),
+        },
+      });
+      const inputSignature = await createSubmissionSignature(requestBody);
+      const reusablePending = pendingSubmission ?? readPendingSubmission(window.localStorage);
+      const submission = reuseOrCreatePendingSubmission({
+        existing: reusablePending,
+        inputSignature,
+        prompt,
+        imageIdentity: image ? imageSubmissionIdentity(image.file) : null,
+      });
+      setPendingSubmission(submission);
+      writePendingSubmission(window.localStorage, submission);
       const response = await apiFetch("/jobs", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          designMode: STEPWISE_DESIGN_MODE,
-          prompt: description,
-          referenceImage: image ? await fileToDataUrl(image.file) : null,
-          fold: primaryFold,
-          candidates,
-          goal: {
-            presetKey: analysis.presetKey,
-            symmetry: true,
-            parts: analysis.parts.map(({ label, importance, direction }) => ({ label, importance, direction })),
-          },
-        }),
+        headers: {
+          "Content-Type": "application/json",
+          "Idempotency-Key": submission.idempotencyKey,
+        },
+        body: requestBody,
       });
       const payload = await response.json() as { ok: boolean; job?: LocalJob; error?: string };
       if (!response.ok || !payload.job) throw new Error(payload.error ?? "生成を開始できませんでした");
       setMessage(payload.job.message);
       setProgress(payload.job.progress ?? null);
       writeStoredActiveJob({ id: payload.job.id, description, startedAt });
+      setPendingSubmission(null);
+      writePendingSubmission(window.localStorage, null);
       const completed = await waitForJob(payload.job.id, (job) => {
         setMessage(job.message);
         setProgress(job.progress ?? null);
       });
       setResult(createDisplayResult(completed, description));
       setRunState("idle");
+      setErrorTarget(null);
       setRunStartedAt(null);
       setMessage("生成が完了しました");
       writeStoredActiveJob(null);
     } catch (error) {
       setRunState("error");
+      setErrorTarget("form");
       setRunStartedAt(null);
       setMessage(error instanceof Error ? error.message : "生成できませんでした");
       writeStoredActiveJob(null);
@@ -449,14 +521,8 @@ export default function Home() {
       </header>
 
       <form className="promptArea" onSubmit={generate}>
-        <label className="promptField" htmlFor="prompt">
-          <span className={runState === "error" ? "fieldError" : undefined}>
-            {runState === "error"
-              ? message
-              : runState === "running"
-                ? "展開図と4段階の最終状態を生成中…"
-                : "つくりたい折り紙を入力"}
-          </span>
+        <div className="promptField">
+          <label className="fieldLabel" htmlFor="prompt">つくりたい折り紙を入力</label>
           <textarea
             id="prompt"
             value={prompt}
@@ -465,11 +531,24 @@ export default function Home() {
             rows={3}
             maxLength={200}
             disabled={runState === "running"}
+            aria-invalid={errorTarget === "prompt"}
+            aria-describedby={errorTarget === "prompt" ? "prompt-error" : undefined}
           />
-        </label>
+          {errorTarget === "prompt" && (
+            <p id="prompt-error" className="fieldError">{message}</p>
+          )}
+        </div>
 
         <div className={`uploadField ${image ? "hasImage" : ""}`}>
-          <input id="reference-image" type="file" accept="image/*" onChange={handleImage} disabled={runState === "running"} />
+          <input
+            id="reference-image"
+            type="file"
+            accept="image/*"
+            onChange={handleImage}
+            disabled={runState === "running"}
+            aria-invalid={errorTarget === "upload"}
+            aria-describedby={errorTarget === "upload" ? "upload-error" : undefined}
+          />
           <label htmlFor="reference-image">
             {image ? (
               <>
@@ -491,10 +570,14 @@ export default function Home() {
               aria-label="アップロード画像を削除"
               disabled={runState === "running"}
               onClick={() => {
+                discardPendingSubmission();
                 setImage(null);
                 resetResult();
               }}
             >×</button>
+          )}
+          {errorTarget === "upload" && (
+            <p id="upload-error" className="fieldError">{message}</p>
           )}
         </div>
 
@@ -502,7 +585,12 @@ export default function Home() {
           {runState === "running" ? `生成中… ${elapsedSeconds}秒` : runState === "error" ? "もう一度生成" : "生成する"}
           <span aria-hidden="true">{runState === "running" ? "◇" : "→"}</span>
         </button>
-        <p className="srOnly" role="status" aria-live="polite">{message}</p>
+        {errorTarget === "form" && (
+          <p className="formError" role="alert">{message}</p>
+        )}
+        {runState !== "running" && errorTarget !== "form" && (
+          <p className="srOnly" role="status" aria-live="polite">{message}</p>
+        )}
       </form>
 
       {runState === "running" && (

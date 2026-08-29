@@ -59,8 +59,9 @@ test("application waits for a 99-point Codex and Oriedita result before showing 
   assert.match(page, /designMode: STEPWISE_DESIGN_MODE/);
   assert.match(page, /codex_mcp_stepwise/);
   assert.match(page, /waitForApiOrigin\(\)/);
-  assert.match(page, /API_RECONNECT_WINDOW_MS = 330_000/);
+  assert.match(page, /API_RECONNECT_WINDOW_MS = 600_000/);
   assert.match(page, /API_REQUEST_TIMEOUT_MS = 8_000/);
+  assert.match(page, /API_JOB_POST_TIMEOUT_MS = 30_000/);
   assert.match(page, /fetchWithTimeout/);
   assert.match(page, /生成サーバーへ接続できませんでした/);
   assert.match(page, /waitForJob\(payload\.job\.id/);
@@ -73,7 +74,11 @@ test("application waits for a 99-point Codex and Oriedita result before showing 
   assert.match(page, /href=\{result\.foldFile\}/);
   assert.match(page, /ACTIVE_JOB_STORAGE_KEY/);
   assert.match(page, /oriai-stepwise:active-codex-job:v1/);
+  assert.match(page, /readPendingSubmission\(window\.localStorage\)/);
+  assert.match(page, /writePendingSubmission\(window\.localStorage, submission\)/);
+  assert.match(page, /"Idempotency-Key": submission\.idempotencyKey/);
   assert.match(page, /writeStoredActiveJob\(\{ id: payload\.job\.id, description, startedAt \}\)/);
+  assert.match(page, /writeStoredActiveJob\([\s\S]+setPendingSubmission\(null\);[\s\S]+writePendingSubmission\(window\.localStorage, null\)/);
   assert.match(page, /waitForJob\(stored\.id, \(job\) =>/);
   assert.match(page, /setProgress\(job\.progress \?\? null\)/);
   assert.match(page, /Oriedita評価済み/);
@@ -113,6 +118,19 @@ test("job polling has no evaluation-duration timeout", async () => {
   assert.match(waitForJob, /for \(let attempt = 0; ; attempt \+= 1\)/);
   assert.doesNotMatch(waitForJob, /attempt < 720/);
   assert.doesNotMatch(waitForJob, /生成処理がタイムアウトしました/);
+});
+
+test("job creation uses one 30-second POST attempt with localized abort messages", async () => {
+  const page = await readFile(new URL("../app/page.tsx", import.meta.url), "utf8");
+  const postBranch = page.slice(
+    page.indexOf('if ((init?.method ?? "GET").toUpperCase() === "POST")'),
+    page.indexOf("let lastError: unknown", page.indexOf("async function apiFetch")),
+  );
+  assert.match(postBranch, /fetchWithTimeout/);
+  assert.match(postBranch, /timeoutMs: API_JOB_POST_TIMEOUT_MS/);
+  assert.match(postBranch, /自動再送はしていません/);
+  assert.match(postBranch, /生成開始の通信が中止されました/);
+  assert.doesNotMatch(postBranch, /for \(/);
 });
 
 test("embed removes analytics and exposes only the WebGL canvas", async () => {

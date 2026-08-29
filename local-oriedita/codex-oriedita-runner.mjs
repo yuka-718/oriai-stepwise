@@ -532,6 +532,12 @@ export function createCodexOperationTracker({
   const openedPaths = [];
   const exportedPaths = [];
   const operationSequence = [];
+  const observedEventSequence = [];
+  const startedToolCalls = [];
+  const completedToolCalls = [];
+  const toolCallLifecycleAnomalies = [];
+  const startedToolCallsById = new Map();
+  const completedToolCallsById = new Map();
   const observedTools = new Set();
   const previousActions = new Set(previousActionKeys instanceof Set ? previousActionKeys : previousActionKeys ?? []);
   const batchActions = new Set();
@@ -540,6 +546,7 @@ export function createCodexOperationTracker({
   let latestCreasePattern = null;
   let creasePatternSequence = 0;
   let documentRevision = 0;
+  let observedSequence = 0;
   let actionPersistenceError = null;
   let actionPersistenceQueue = Promise.resolve();
 
@@ -561,12 +568,91 @@ export function createCodexOperationTracker({
 
   const ingestEvent = (event) => {
     const observed = observedOrieditaCall(event);
-    if (observed?.tool) observedTools.add(observed.tool);
+    let completedLifecycleRecord = null;
+    if (observed?.tool) {
+      observedTools.add(observed.tool);
+      observedSequence += 1;
+      const callId = typeof observed.id === "string" && observed.id ? observed.id : null;
+      const observedPath = observed.arguments?.path
+        ?? observed.arguments?.file_path
+        ?? observed.arguments?.filePath;
+      const resolvedObservedPath = typeof observedPath === "string"
+        ? resolve(baseDirectory, observedPath)
+        : null;
+      if (event?.type === "item.started") {
+        const startedRecord = {
+          observed_sequence: observedSequence,
+          event_type: "started",
+          call_id: callId,
+          tool: observed.tool,
+          arguments: observed.arguments ?? null,
+          path: resolvedObservedPath,
+        };
+        startedToolCalls.push(startedRecord);
+        observedEventSequence.push(startedRecord);
+        if (!callId) {
+          toolCallLifecycleAnomalies.push({
+            kind: "started_without_id",
+            tool: observed.tool,
+            call_id: null,
+            observed_sequence: observedSequence,
+          });
+        } else if (startedToolCallsById.has(callId)) {
+          toolCallLifecycleAnomalies.push({
+            kind: "duplicate_started_id",
+            tool: observed.tool,
+            started_tool: startedToolCallsById.get(callId).tool,
+            call_id: callId,
+            observed_sequence: observedSequence,
+          });
+        } else {
+          startedToolCallsById.set(callId, startedRecord);
+        }
+      } else if (event?.type === "item.completed") {
+        const startedRecord = callId ? startedToolCallsById.get(callId) : null;
+        completedLifecycleRecord = {
+          observed_sequence: observedSequence,
+          event_type: "completed",
+          call_id: callId,
+          tool: observed.tool,
+          arguments: observed.arguments ?? null,
+          path: resolvedObservedPath,
+          completed: toolCallSucceeded(observed),
+          matched_started: Boolean(startedRecord && startedRecord.tool === observed.tool),
+          started_observed_sequence: startedRecord?.observed_sequence ?? null,
+        };
+        completedToolCalls.push(completedLifecycleRecord);
+        observedEventSequence.push(completedLifecycleRecord);
+        if (callId && completedToolCallsById.has(callId)) {
+          toolCallLifecycleAnomalies.push({
+            kind: "duplicate_completed_id",
+            tool: observed.tool,
+            call_id: callId,
+            observed_sequence: observedSequence,
+          });
+        } else if (callId) {
+          completedToolCallsById.set(callId, completedLifecycleRecord);
+        }
+        if (startedRecord && startedRecord.tool !== observed.tool) {
+          toolCallLifecycleAnomalies.push({
+            kind: "completed_tool_mismatch",
+            tool: observed.tool,
+            started_tool: startedRecord.tool,
+            call_id: callId,
+            observed_sequence: observedSequence,
+          });
+        }
+      }
+    }
     const item = completedOrieditaCall(event);
     if (!item) return false;
     const eventSequence = operationSequence.length + 1;
     const sequenceEvent = {
       sequence: eventSequence,
+      observed_sequence: completedLifecycleRecord?.observed_sequence ?? null,
+      started_observed_sequence: completedLifecycleRecord?.started_observed_sequence ?? null,
+      call_id: completedLifecycleRecord?.call_id ?? null,
+      matched_started: completedLifecycleRecord?.matched_started === true,
       tool: item.tool,
       completed: toolCallSucceeded(item),
     };
@@ -579,12 +665,16 @@ export function createCodexOperationTracker({
         ...creasePatternResult(item),
         sequence: creasePatternSequence,
         event_sequence: eventSequence,
+        call_id: sequenceEvent.call_id,
+        started_observed_sequence: sequenceEvent.started_observed_sequence,
+        completed_observed_sequence: sequenceEvent.observed_sequence,
         document_revision: documentRevision,
       };
       Object.assign(sequenceEvent, {
         evidence_completed: pattern.completed,
         line_count: pattern.line_count,
         hash: pattern.hash,
+        document_revision: pattern.document_revision,
       });
       const iteration = iterations[currentIterationIndex];
       if (iteration?.add_line
@@ -612,6 +702,7 @@ export function createCodexOperationTracker({
             line_count_after: after.line_count,
             crease_hash_before: iteration.crease_pattern_before?.hash ?? null,
             crease_hash_after: after.hash,
+            call_id: iteration.add_line.call_id,
           });
         }
       } else {
@@ -624,11 +715,19 @@ export function createCodexOperationTracker({
         const addLine = {
           ...addLineResult(item),
           event_sequence: eventSequence,
+          call_id: completedLifecycleRecord?.call_id ?? null,
+          started_observed_sequence: sequenceEvent.started_observed_sequence,
+          completed_observed_sequence: sequenceEvent.observed_sequence,
         };
         Object.assign(sequenceEvent, {
+          call_id: addLine.call_id,
           action_key: addLine.action_key,
           response_matches_request: addLine.response_matches_request,
         });
+        if (completedLifecycleRecord) {
+          completedLifecycleRecord.action_key = addLine.action_key;
+          completedLifecycleRecord.response_matches_request = addLine.response_matches_request;
+        }
         const actionKey = addLine.action_key;
         iterations[currentIterationIndex] = {
           step: currentIterationIndex + 1,
@@ -660,10 +759,17 @@ export function createCodexOperationTracker({
             response_matches_request: addLine.response_matches_request,
             reported_line_count: addLine.reported_line_count,
             tool_completed: addLine.completed,
+            call_id: addLine.call_id,
           });
         }
       }
-      if (toolCallSucceeded(item)) documentRevision += 1;
+      if (toolCallSucceeded(item)) {
+        documentRevision += 1;
+        sequenceEvent.document_revision = documentRevision;
+        if (iterations[currentIterationIndex]?.add_line) {
+          iterations[currentIterationIndex].add_line.document_revision = documentRevision;
+        }
+      }
       latestCreasePattern = null;
     } else if (item.tool === "calculate_fold") {
       counts.calculate_fold += 1;
@@ -671,10 +777,15 @@ export function createCodexOperationTracker({
       const result = {
         ...foldCalculationResult(item),
         event_sequence: eventSequence,
+        call_id: sequenceEvent.call_id,
+        started_observed_sequence: sequenceEvent.started_observed_sequence,
+        completed_observed_sequence: sequenceEvent.observed_sequence,
+        document_revision: documentRevision,
       };
       Object.assign(sequenceEvent, {
         started: result.started,
         violation_count: result.violation_count,
+        document_revision: result.document_revision,
       });
       if (iteration && iteration.get_folded_figure == null
         && (iteration.calculate_fold == null || iteration.calculate_fold.completed !== true)) {
@@ -686,10 +797,15 @@ export function createCodexOperationTracker({
       const result = {
         ...foldedFigureResult(item),
         event_sequence: eventSequence,
+        call_id: sequenceEvent.call_id,
+        started_observed_sequence: sequenceEvent.started_observed_sequence,
+        completed_observed_sequence: sequenceEvent.observed_sequence,
+        document_revision: documentRevision,
       };
       Object.assign(sequenceEvent, {
         image_present: result.image_present,
         mime_type: result.mime_type,
+        document_revision: result.document_revision,
       });
       if (iteration && iteration.calculate_fold
         && (iteration.get_folded_figure == null
@@ -706,10 +822,18 @@ export function createCodexOperationTracker({
         if (toolCallSucceeded(item)) {
           counts.open_file += 1;
           documentRevision += 1;
+          sequenceEvent.document_revision = documentRevision;
           latestCreasePattern = null;
           const iteration = iterations[currentIterationIndex];
           if (iteration && (iteration.calculate_fold != null || iteration.get_folded_figure != null)) {
-            iteration.rollback = { completed: true, path: resolvedPath, event_sequence: eventSequence };
+            iteration.rollback = {
+              completed: true,
+              path: resolvedPath,
+              event_sequence: eventSequence,
+              call_id: sequenceEvent.call_id,
+              started_observed_sequence: sequenceEvent.started_observed_sequence,
+              completed_observed_sequence: sequenceEvent.observed_sequence,
+            };
             currentIterationIndex = -1;
           }
         }
@@ -718,7 +842,14 @@ export function createCodexOperationTracker({
         const completed = toolCallSucceeded(item);
         if (completed) counts.export_file += 1;
         const iteration = iterations[currentIterationIndex];
-        if (iteration) iteration.exports.push({ completed, path: resolvedPath, event_sequence: eventSequence });
+        if (iteration) iteration.exports.push({
+          completed,
+          path: resolvedPath,
+          event_sequence: eventSequence,
+          call_id: sequenceEvent.call_id,
+          started_observed_sequence: sequenceEvent.started_observed_sequence,
+          completed_observed_sequence: sequenceEvent.observed_sequence,
+        });
       }
     } else {
       return false;
@@ -758,6 +889,12 @@ export function createCodexOperationTracker({
         opened_paths: [...openedPaths],
         exported_paths: [...exportedPaths],
         operation_sequence: operationSequence.map((entry) => ({ ...entry })),
+        observed_sequence: observedEventSequence.map((entry) => ({ ...entry })),
+        tool_call_lifecycle: {
+          started: startedToolCalls.map((entry) => ({ ...entry })),
+          completed: completedToolCalls.map((entry) => ({ ...entry })),
+          anomalies: toolCallLifecycleAnomalies.map((entry) => ({ ...entry })),
+        },
         observed_tools: [...observedTools],
       };
     },
@@ -785,7 +922,100 @@ export function shouldRetryCodexOrieditaAttempt(snapshot, {
     && (snapshot?.exported_paths?.length ?? 0) === 0;
 }
 
-export function assertCodexOperationSnapshot(snapshot, maximumIterations = 10) {
+export function assertCodexObservedCallLifecycle(snapshot, {
+  requireStartedEvents = true,
+} = {}) {
+  const observed = Array.isArray(snapshot?.observed_sequence) ? snapshot.observed_sequence : [];
+  const lifecycle = snapshot?.tool_call_lifecycle ?? {};
+  const started = Array.isArray(lifecycle.started) ? lifecycle.started : [];
+  const completed = Array.isArray(lifecycle.completed) ? lifecycle.completed : [];
+  const anomalies = Array.isArray(lifecycle.anomalies) ? lifecycle.anomalies : [];
+  const monotonic = observed.every((entry, index) =>
+    Number.isInteger(entry?.observed_sequence)
+    && entry.observed_sequence === index + 1);
+  let consistent = monotonic && observed.length === started.length + completed.length;
+
+  if (requireStartedEvents) {
+    consistent = consistent
+      && started.length > 0
+      && anomalies.length === 0
+      && started.length === completed.length
+      && started.every((start) =>
+        typeof start?.call_id === "string"
+        && start.call_id.length > 0
+        && completed.filter((completion) =>
+          completion?.call_id === start.call_id
+          && completion?.tool === start.tool
+          && completion?.matched_started === true
+          && completion?.started_observed_sequence === start.observed_sequence
+          && completion?.observed_sequence > start.observed_sequence).length === 1)
+      && completed.every((completion) =>
+        typeof completion?.call_id === "string"
+        && completion.call_id.length > 0
+        && completion?.matched_started === true);
+  }
+
+  if (!consistent) {
+    throw new Error(`CodexのOriedita observed event lifecycleが一致しません (observed ${observed.length}、started ${started.length}、completed ${completed.length}、anomalies ${anomalies.length})`);
+  }
+  return {
+    observed_events: observed.length,
+    started_calls: started.length,
+    completed_calls: completed.length,
+  };
+}
+
+export function assertCodexAddLineCallLifecycle(snapshot, maximumIterations = 10, {
+  requireStartedEvents = true,
+} = {}) {
+  const maximum = Math.max(1, Math.min(10, Math.floor(Number(maximumIterations) || 10)));
+  const lifecycle = snapshot?.tool_call_lifecycle ?? {};
+  const started = Array.isArray(lifecycle.started)
+    ? lifecycle.started.filter((entry) => entry?.tool === "add_line")
+    : [];
+  const completed = Array.isArray(lifecycle.completed)
+    ? lifecycle.completed.filter((entry) => entry?.tool === "add_line")
+    : [];
+  const anomalies = Array.isArray(lifecycle.anomalies)
+    ? lifecycle.anomalies.filter((entry) => entry?.tool === "add_line" || entry?.started_tool === "add_line")
+    : [];
+  const iterations = Array.isArray(snapshot?.iterations) ? snapshot.iterations.slice(0, maximum) : [];
+  const completedCount = Number(snapshot?.counts?.add_line ?? 0);
+  const evidenceConsistent = iterations.length === maximum && iterations.every((iteration, index) =>
+    iteration?.action_attempt_recorded === true
+    && iteration?.action_evidence_recorded === true
+    && iteration?.add_line?.action_key === snapshot?.action_keys?.[index]);
+  let lifecycleConsistent = anomalies.length === 0 && completed.length === maximum;
+
+  // Production JSONL must contain a one-to-one started/completed pair for each
+  // add_line. Completion-only evidence is available solely as an explicit
+  // compatibility escape hatch for old synthetic fixtures.
+  if (requireStartedEvents || started.length > 0) {
+    const uniqueStartedIds = new Set(started.map((entry) => entry?.call_id).filter(Boolean));
+    lifecycleConsistent = lifecycleConsistent
+      && started.length === maximum
+      && uniqueStartedIds.size === maximum
+      && started.every((entry) => completed.filter((candidate) =>
+        candidate?.call_id === entry.call_id
+        && candidate?.matched_started === true
+        && candidate?.completed === true).length === 1)
+      && iterations.every((iteration) => {
+        const callId = iteration?.add_line?.call_id;
+        const completion = completed.find((entry) => entry?.call_id === callId);
+        return uniqueStartedIds.has(callId)
+          && completion?.completed === true
+          && completion?.action_key === iteration.add_line.action_key
+          && completion?.response_matches_request === true;
+      });
+  }
+  if (completedCount !== maximum || !evidenceConsistent || !lifecycleConsistent) {
+    throw new Error(`Codexのadd_line MCP呼出しとWAL証跡が一致しません (折り線 ${completedCount}/${maximum}、started ${started.length}、completed ${completed.length}、anomalies ${anomalies.length})`);
+  }
+}
+
+export function assertCodexOperationSnapshot(snapshot, maximumIterations = 10, {
+  requireStartedEvents = true,
+} = {}) {
   const maximum = Math.max(1, Math.min(10, Math.floor(Number(maximumIterations) || 10)));
   const counts = snapshot?.counts ?? {};
   const iterations = Array.isArray(snapshot?.iterations) ? snapshot.iterations : [];
@@ -802,6 +1032,109 @@ export function assertCodexOperationSnapshot(snapshot, maximumIterations = 10) {
     const failedText = failed.length ? `、失敗 step: ${failed.join(", ")}` : "";
     throw new Error(`CodexのOriedita実操作が完了していません (CP前後確認 ${counts.get_crease_pattern ?? 0}/${maximum * 2}、折り線 ${counts.add_line ?? 0}/${maximum}、折り計算 ${counts.calculate_fold ?? 0}/${maximum}、画像確認 ${counts.get_folded_figure ?? 0}/${maximum}${failedText})`);
   }
+  assertCodexObservedCallLifecycle(snapshot, { requireStartedEvents });
+  assertCodexAddLineCallLifecycle(snapshot, maximum, { requireStartedEvents });
+}
+
+export async function assertCodexActionWalEvidence(snapshot, {
+  actionWalPath,
+  maximumIterations = 10,
+  iterationOffset = 0,
+} = {}) {
+  if (typeof actionWalPath !== "string" || !isAbsolute(actionWalPath)) {
+    throw new Error("Codex action WALの絶対パスがありません");
+  }
+  const maximum = Math.max(1, Math.min(10, Math.floor(Number(maximumIterations) || 10)));
+  const offset = normalizeIterationOffset(iterationOffset);
+  const expectedBatch = Math.floor(offset / maximum) + 1;
+  const iterations = Array.isArray(snapshot?.iterations) ? snapshot.iterations.slice(0, maximum) : [];
+  const actionKeys = Array.isArray(snapshot?.action_keys) ? snapshot.action_keys.slice(0, maximum) : [];
+  let records;
+  try {
+    const text = (await readSecureRegularFile(resolve(actionWalPath))).toString("utf8");
+    records = text.split(/\r?\n/).filter((line) => line.trim()).map((line, index) => {
+      try {
+        return { record: JSON.parse(line), record_index: index + 1 };
+      } catch {
+        throw new Error(`Codex action WALの${index + 1}行目がJSONではありません`);
+      }
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message.startsWith("Codex action WAL")) throw error;
+    throw new Error(`Codex action WALを安全に再読できません: ${error instanceof Error ? error.message : error}`);
+  }
+
+  const failures = [];
+  const matchedCallIds = [];
+  for (let index = 0; index < maximum; index += 1) {
+    const operation = iterations[index];
+    const actionKey = actionKeys[index];
+    const callId = operation?.add_line?.call_id;
+    const matching = records.filter(({ record }) => record?.action_key === actionKey);
+    const byPhase = Object.fromEntries(["intent", "inflight", "evidenced"].map((phase) => [
+      phase,
+      matching.filter(({ record }) => record?.phase === phase),
+    ]));
+    const prefix = `step ${index + 1}`;
+    if (typeof actionKey !== "string" || !actionKey || typeof callId !== "string" || !callId) {
+      failures.push(`${prefix}: action key/call IDなし`);
+      continue;
+    }
+    if (matching.length !== 3
+        || byPhase.intent.length !== 1
+        || byPhase.inflight.length !== 1
+        || byPhase.evidenced.length !== 1) {
+      failures.push(`${prefix}: intent/inflight/evidenced三相が一意ではありません`);
+      continue;
+    }
+    const intent = byPhase.intent[0];
+    const inflight = byPhase.inflight[0];
+    const evidenced = byPhase.evidenced[0];
+    const commonRecordMatches = [intent, inflight, evidenced].every(({ record }) =>
+      record?.schema === "oriai-codex-action-wal-v1"
+      && record?.batch === expectedBatch
+      && record?.batch_step === index + 1
+      && record?.step === offset + index + 1
+      && record?.action_key === actionKey);
+    const phaseOrderMatches = intent.record_index < inflight.record_index
+      && inflight.record_index < evidenced.record_index;
+    const actionArgumentsMatch = [intent, inflight, evidenced].every(({ record }) =>
+      codexActionKey(record?.arguments) === actionKey);
+    const callEvidenceMatches = inflight.record?.call_id === callId
+      && evidenced.record?.call_id === callId
+      && inflight.record?.tool_completed === true
+      && inflight.record?.response_matches_request === true
+      && inflight.record?.response_action_key === actionKey
+      && evidenced.record?.response_action_key === actionKey;
+    const cpEvidenceMatches = inflight.record?.reported_line_count === operation?.add_line?.reported_line_count
+      && evidenced.record?.line_count_before === operation?.crease_pattern_before?.line_count
+      && evidenced.record?.line_count_after === operation?.crease_pattern_after?.line_count
+      && evidenced.record?.crease_hash_before === operation?.crease_pattern_before?.hash
+      && evidenced.record?.crease_hash_after === operation?.crease_pattern_after?.hash;
+    if (!commonRecordMatches || !phaseOrderMatches || !actionArgumentsMatch
+        || !callEvidenceMatches || !cpEvidenceMatches) {
+      failures.push(`${prefix}: 永続WALとadd_line/CP証跡が一致しません`);
+      continue;
+    }
+    matchedCallIds.push(callId);
+  }
+  if (iterations.length !== maximum || actionKeys.length !== maximum
+      || matchedCallIds.length !== maximum || failures.length) {
+    throw new Error(`Codex action WALの三相証跡を確認できません (${failures.join("、") || `${matchedCallIds.length}/${maximum}`})`);
+  }
+  return {
+    schema: "oriai-codex-action-wal-audit-v1",
+    required: true,
+    verified: true,
+    verified_action_count: matchedCallIds.length,
+    current_phase_counts: {
+      intent: matchedCallIds.length,
+      inflight: matchedCallIds.length,
+      evidenced: matchedCallIds.length,
+    },
+    matched_call_ids: matchedCallIds,
+    persisted_record_count: records.length,
+  };
 }
 
 export function mergeActualToolResults(steps, snapshot, maximumIterations = 10) {
@@ -838,31 +1171,42 @@ export function assertAllowedOrieditaPaths(snapshot, {
 
 /**
  * Fail closed unless a one-step process proves the complete causal order from
- * the committed starting FOLD through the accept-or-rollback decision.
- * `operation_sequence` is built only from completed Oriedita MCP events, not
- * from the model-authored result JSON.
+ * the committed starting FOLD through the accept-or-rollback decision and the
+ * one permitted post-decision final-crease export.
+ * `operation_sequence` is built from completed Oriedita MCP events and links
+ * each completion to its factual `item.started` event in `observed_sequence`.
  */
 export function assertOneStepCodexEvidenceOrder(snapshot, {
   initialFoldPath,
   finalFoldPath,
+  finalCreasePath,
   accepted,
 } = {}) {
   const expectedInitialPath = initialFoldPath ? resolve(initialFoldPath) : null;
   const expectedFinalPath = finalFoldPath ? resolve(finalFoldPath) : null;
+  const expectedFinalCreasePath = finalCreasePath ? resolve(finalCreasePath) : null;
   const iteration = Array.isArray(snapshot?.iterations) ? snapshot.iterations[0] : null;
   const sequence = Array.isArray(snapshot?.operation_sequence) ? snapshot.operation_sequence : [];
-  if (!expectedInitialPath || !expectedFinalPath || typeof accepted !== "boolean" || !iteration) {
+  const observedEvents = Array.isArray(snapshot?.observed_sequence) ? snapshot.observed_sequence : [];
+  if (!expectedInitialPath || !expectedFinalPath || !expectedFinalCreasePath
+      || typeof accepted !== "boolean" || !iteration) {
     throw new Error("Codex一手評価の順序検証に必要な証跡がありません");
   }
   if (iteration.successful !== true) {
     throw new Error("Codex一手評価のCP変更・平坦折り計算・画像確認が成功していません");
   }
+  assertCodexObservedCallLifecycle(snapshot, { requireStartedEvents: true });
 
   const beforeSequence = iteration?.crease_pattern_before?.event_sequence;
   const addSequence = iteration?.add_line?.event_sequence;
   const afterSequence = iteration?.crease_pattern_after?.event_sequence;
   const calculateSequence = iteration?.calculate_fold?.event_sequence;
   const imageSequence = iteration?.get_folded_figure?.event_sequence;
+  const beforeRevision = iteration?.crease_pattern_before?.document_revision;
+  const addRevision = iteration?.add_line?.document_revision;
+  const afterRevision = iteration?.crease_pattern_after?.document_revision;
+  const calculateRevision = iteration?.calculate_fold?.document_revision;
+  const imageRevision = iteration?.get_folded_figure?.document_revision;
   const startingOpen = sequence
     .filter((entry) => entry?.tool === "open_file"
       && entry.completed === true
@@ -872,6 +1216,16 @@ export function assertOneStepCodexEvidenceOrder(snapshot, {
     .at(-1);
   if (!startingOpen) {
     throw new Error("Codex一手評価で正確な開始FOLDをopen_fileした証跡がありません");
+  }
+  const sameAddedDocument = Number.isInteger(beforeRevision)
+    && beforeRevision === startingOpen.document_revision
+    && Number.isInteger(addRevision)
+    && addRevision === beforeRevision + 1
+    && afterRevision === addRevision
+    && calculateRevision === addRevision
+    && imageRevision === addRevision;
+  if (!sameAddedDocument) {
+    throw new Error("Codex一手評価のCP追加後・平坦折り計算・画像が同じdocument revisionではありません");
   }
 
   const finalFoldEventsAfterAdd = sequence.filter((entry) =>
@@ -892,13 +1246,79 @@ export function assertOneStepCodexEvidenceOrder(snapshot, {
     ? iteration.rollback
     : null;
   const decision = accepted ? acceptedSave : rejectedRollback;
-  const opposingDecision = accepted
-    ? finalFoldEventsAfterAdd.find((entry) => entry.tool === "open_file")
-    : finalFoldEventsAfterAdd.find((entry) => entry.tool === "export_file");
-  if (!decision || opposingDecision) {
+  const expectedDecisionTool = accepted ? "export_file" : "open_file";
+  const expectedDecisionEvents = finalFoldEventsAfterAdd.filter((entry) => entry.tool === expectedDecisionTool);
+  const opposingDecision = finalFoldEventsAfterAdd.find((entry) => entry.tool !== expectedDecisionTool);
+  if (!decision || expectedDecisionEvents.length !== 1 || opposingDecision
+      || decision.event_sequence !== expectedDecisionEvents[0]?.sequence) {
     throw new Error(accepted
       ? "Codex一手評価の画像確認後に最良FOLDを保存した証跡がありません"
       : "Codex一手評価の画像確認後に最良FOLDへ巻き戻した証跡がありません");
+  }
+
+  const completionEvent = (eventSequence, tool) => sequence.find((entry) =>
+    entry?.sequence === eventSequence && entry?.tool === tool && entry?.completed === true);
+  const beforeEvent = completionEvent(beforeSequence, "get_crease_pattern");
+  const addEvent = completionEvent(addSequence, "add_line");
+  const afterEvent = completionEvent(afterSequence, "get_crease_pattern");
+  const calculateEvent = completionEvent(calculateSequence, "calculate_fold");
+  const imageEvent = completionEvent(imageSequence, "get_folded_figure");
+  const decisionEvent = completionEvent(decision.event_sequence, expectedDecisionTool);
+  const finalCreaseEvents = sequence.filter((entry) =>
+    entry?.tool === "export_file"
+    && entry?.path === expectedFinalCreasePath
+    && entry?.completed === true
+    && entry?.started_observed_sequence > decisionEvent?.observed_sequence);
+  const finalCreaseEvent = finalCreaseEvents.length === 1 ? finalCreaseEvents[0] : null;
+  const causalEvents = [
+    ["開始FOLD open_file", startingOpen],
+    ["CP前 get_crease_pattern", beforeEvent],
+    ["add_line", addEvent],
+    ["CP後 get_crease_pattern", afterEvent],
+    ["calculate_fold", calculateEvent],
+    ["get_folded_figure", imageEvent],
+    [accepted ? "採用 export_file" : "不採用 rollback open_file", decisionEvent],
+    ["最終展開図 export_file", finalCreaseEvent],
+  ];
+  const hasValidSpan = (entry) => {
+    if (!entry
+        || entry.matched_started !== true
+        || typeof entry.call_id !== "string"
+        || !Number.isInteger(entry.started_observed_sequence)
+        || !Number.isInteger(entry.observed_sequence)
+        || entry.started_observed_sequence >= entry.observed_sequence) return false;
+    const linkedStart = observedEvents.find((event) =>
+      event?.event_type === "started"
+      && event?.observed_sequence === entry.started_observed_sequence
+      && event?.call_id === entry.call_id
+      && event?.tool === entry.tool);
+    if (!linkedStart) return false;
+    return (entry.tool !== "open_file" && entry.tool !== "export_file")
+      || linkedStart.path === entry.path;
+  };
+  const invalidSpan = causalEvents.find(([, entry]) => !hasValidSpan(entry));
+  if (invalidSpan) {
+    throw new Error(`Codex一手評価の${invalidSpan[0]}に対応するstarted/completed証跡がありません`);
+  }
+  const causalOrderValid = causalEvents.every(([, entry], index) =>
+    index === 0 || causalEvents[index - 1][1].observed_sequence < entry.started_observed_sequence);
+  if (!causalOrderValid) {
+    throw new Error("Codex一手評価のMCP操作が重複しています (open完了→CP前開始/完了→add開始/完了→CP後開始/完了→calculate開始/完了→画像開始/完了→採否開始/完了→最終展開図export開始/完了 が必須)");
+  }
+
+  const observedStateStarts = observedEvents.filter((entry) =>
+    entry?.event_type === "started"
+    && (entry.tool === "open_file" || entry.tool === "export_file"));
+  const expectedStateStartSequences = [
+    startingOpen.started_observed_sequence,
+    decisionEvent.started_observed_sequence,
+    finalCreaseEvent.started_observed_sequence,
+  ];
+  const exactStateSequence = observedStateStarts.length === expectedStateStartSequences.length
+    && observedStateStarts.every((entry, index) =>
+      entry.observed_sequence === expectedStateStartSequences[index]);
+  if (!exactStateSequence) {
+    throw new Error("Codex一手評価では開始FOLD open、採否操作、最終展開図export以外のopen_file/export_file attemptを許可しません");
   }
 
   const orderedSequences = [
@@ -909,11 +1329,12 @@ export function assertOneStepCodexEvidenceOrder(snapshot, {
     calculateSequence,
     imageSequence,
     decision.event_sequence,
+    finalCreaseEvent.sequence,
   ];
   const strictlyOrdered = orderedSequences.every(Number.isInteger)
     && orderedSequences.every((value, index) => index === 0 || value > orderedSequences[index - 1]);
   if (!strictlyOrdered) {
-    throw new Error("Codex一手評価の実操作順序が open→CP前→add_line→CP後→calculate→画像→採否 と一致しません");
+    throw new Error("Codex一手評価の実操作順序が open→CP前→add_line→CP後→calculate→画像→採否→最終展開図export と一致しません");
   }
   return orderedSequences;
 }
@@ -930,15 +1351,22 @@ export function assertCodexDecisionEvidence(steps, snapshot, {
   for (const [index, step] of (Array.isArray(steps) ? steps : []).entries()) {
     const operation = operations[index];
     const score = Number(step?.score);
-    const accepted = step?.accepted === true
-      && Number.isFinite(score)
-      && score > bestAcceptedScore;
-    effectiveAccepted.push(accepted);
-    if (accepted) {
+    const mustAccept = Number.isFinite(score) && score > bestAcceptedScore;
+    const claimedAccepted = step?.accepted === true;
+    effectiveAccepted.push(mustAccept);
+    if (claimedAccepted !== mustAccept) {
+      missing.push(mustAccept
+        ? `step ${index + 1}: 改善候補はaccepted=trueが必須`
+        : `step ${index + 1}: 同点・悪化候補はaccepted=falseが必須`);
+    }
+    if (mustAccept) {
       bestAcceptedScore = score;
       const saved = operation?.exports?.some((entry) =>
         entry?.completed === true && entry.path === expectedFinalPath);
       if (!saved) missing.push(`step ${index + 1}: 最良FOLD保存なし`);
+      if (operation?.rollback?.completed === true) {
+        missing.push(`step ${index + 1}: 改善候補を最良FOLDへ巻き戻し`);
+      }
     } else {
       const incorrectlySaved = operation?.exports?.some((entry) =>
         entry?.completed === true && entry.path === expectedFinalPath);
@@ -1382,11 +1810,26 @@ export async function runCodexOrieditaLoop({
     break;
   }
 
-  assertCodexOperationSnapshot(operationSnapshot, boundedIterations);
+  assertCodexOperationSnapshot(operationSnapshot, boundedIterations, { requireStartedEvents: true });
   const verifiedActionKeys = assertNovelCodexActionKeys(operationSnapshot?.action_keys, {
     previousActionKeys,
     expectedCount: boundedIterations,
   });
+  const actionWalAudit = actionWalPath
+    ? await assertCodexActionWalEvidence(operationSnapshot, {
+      actionWalPath: resolve(actionWalPath),
+      maximumIterations: boundedIterations,
+      iterationOffset,
+    })
+    : {
+      schema: "oriai-codex-action-wal-audit-v1",
+      required: false,
+      verified: false,
+      verified_action_count: 0,
+      current_phase_counts: { intent: 0, inflight: 0, evidenced: 0 },
+      matched_call_ids: [],
+      persisted_record_count: 0,
+    };
   assertAllowedOrieditaPaths(operationSnapshot, { initialFoldPath, finalFoldPath, finalCreasePath });
 
   const result = JSON.parse(await readFile(outputPath, "utf8"));
@@ -1401,6 +1844,7 @@ export async function runCodexOrieditaLoop({
     assertOneStepCodexEvidenceOrder(operationSnapshot, {
       initialFoldPath,
       finalFoldPath,
+      finalCreasePath,
       accepted: effectiveAccepted[0] === true,
     });
   }
@@ -1429,6 +1873,10 @@ export async function runCodexOrieditaLoop({
       action_keys: verifiedActionKeys,
       opened_paths: operationSnapshot.opened_paths,
       exported_paths: operationSnapshot.exported_paths,
+      operation_sequence: operationSnapshot.operation_sequence,
+      observed_sequence: operationSnapshot.observed_sequence,
+      tool_call_lifecycle: operationSnapshot.tool_call_lifecycle,
+      action_wal: actionWalAudit,
     },
   };
   } finally {

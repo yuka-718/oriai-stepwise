@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { execFileSync, spawn } from "node:child_process";
-import { randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
 import { readlinkSync } from "node:fs";
 import { access, appendFile, copyFile, mkdir, open, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
 import { createServer } from "node:http";
@@ -74,16 +74,16 @@ const host = process.env.ORI_AI_LOCAL_HOST ?? "127.0.0.1";
 const codexBatchIterations = 10;
 const codexStepwiseIterations = 1;
 const codexDesignModes = new Set(["codex_mcp_loop", "codex_mcp_stepwise"]);
-const requestableDesignModes = new Set(codexDesignModes);
+const requestableDesignModes = new Set(["codex_mcp_stepwise"]);
 const evaluationLimit = null;
 const maxCycles = 10;
 const targetScore = 99;
 const configuredDesignMode = process.env.ORI_AI_DESIGN_MODE?.trim();
 const designMode = configuredDesignMode === "regeneration"
   || configuredDesignMode === "crease_step_search"
-  || codexDesignModes.has(configuredDesignMode)
+  || configuredDesignMode === "codex_mcp_stepwise"
   ? configuredDesignMode
-  : "codex_mcp_loop";
+  : "codex_mcp_stepwise";
 const stepBranchFactor = Math.min(3, Math.max(1, Number.parseInt(process.env.ORI_AI_STEP_BRANCH_FACTOR ?? "2", 10)));
 const stepBeamWidth = Math.min(2, Math.max(1, Number.parseInt(process.env.ORI_AI_STEP_BEAM_WIDTH ?? "1", 10)));
 const jobTimeoutMs = Math.max(60_000, Number.parseInt(process.env.ORI_AI_JOB_TIMEOUT_MS ?? "1200000", 10));
@@ -147,12 +147,15 @@ export function codexExecutionMetadata(mode) {
 }
 
 export function codexServiceMetadata(defaultMode = designMode) {
+  const publicDefaultMode = requestableDesignModes.has(defaultMode)
+    ? defaultMode
+    : "codex_mcp_stepwise";
   return {
-    supportedModes: [...codexDesignModes],
-    defaultMode,
-    active: codexExecutionMetadata(defaultMode),
+    supportedModes: [...requestableDesignModes],
+    defaultMode: publicDefaultMode,
+    active: codexExecutionMetadata(publicDefaultMode),
     modes: Object.fromEntries(
-      [...codexDesignModes].map((mode) => [mode, codexExecutionMetadata(mode)]),
+      [...requestableDesignModes].map((mode) => [mode, codexExecutionMetadata(mode)]),
     ),
   };
 }
@@ -171,7 +174,7 @@ export function resolveDesignModeSelection({
   }
   const mode = pipeline === "corigami_final_state_v1"
     ? "corigami_final_state_v1"
-    : normalizedRequestedMode ?? defaultMode;
+    : normalizedRequestedMode ?? (defaultMode === "codex_mcp_loop" ? "codex_mcp_stepwise" : defaultMode);
   const batchSize = codexBatchSizeForMode(mode);
   return {
     mode,
@@ -548,9 +551,12 @@ const queue = [];
 const maximumWaitingJobs = 3;
 const JOB_REQUEUE = Symbol("JOB_REQUEUE");
 const jobIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const requestFingerprintPattern = /^[0-9a-f]{64}$/i;
 const submissionWindows = new Map();
 const jobAbortControllers = new Map();
 const codexActionHistoryByJob = new Map();
+const designJobIdsByIdempotencyKey = new Map();
+const designJobCreationsByIdempotencyKey = new Map();
 let activeJobId = null;
 let activeJobPromise = null;
 let activeOrieditaConnection = null;
@@ -567,7 +573,7 @@ function isAllowedOrigin(origin) {
 function corsHeaders(origin) {
   const headers = {
     "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "Authorization, Content-Type",
+    "Access-Control-Allow-Headers": "Authorization, Content-Type, Idempotency-Key",
     "Access-Control-Allow-Private-Network": "true",
     "Access-Control-Max-Age": "600",
     "Cache-Control": "no-store",
@@ -629,6 +635,36 @@ class HttpError extends Error {
   }
 }
 
+export function validateIdempotencyKey(value) {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "string" || !jobIdPattern.test(value.trim())) {
+    throw new HttpError(400, "Idempotency-KeyにはUUID形式を指定してください");
+  }
+  return value.trim().toLowerCase();
+}
+
+function canonicalRequestValue(value) {
+  if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
+    return { $binary: Buffer.from(value).toString("base64") };
+  }
+  if (Array.isArray(value)) return value.map(canonicalRequestValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.keys(value)
+        .sort()
+        .filter((key) => value[key] !== undefined)
+        .map((key) => [key, canonicalRequestValue(value[key])]),
+    );
+  }
+  return value;
+}
+
+export function fingerprintDesignRequest(input) {
+  return createHash("sha256")
+    .update(JSON.stringify(canonicalRequestValue(input)))
+    .digest("hex");
+}
+
 export function createJobAdmissionGate({
   queueList,
   isActive,
@@ -663,6 +699,72 @@ export function createJobAdmissionGate({
       }
     },
   };
+}
+
+export async function runIdempotentJobCreation({
+  idempotencyKey = null,
+  requestFingerprint = null,
+  gate,
+  jobsMap,
+  idempotencyMap,
+  inflightMap,
+  beforeCreate = () => {},
+  create,
+}) {
+  if (!idempotencyKey) {
+    return gate.run(async () => {
+      await beforeCreate();
+      return { job: await create(), created: true };
+    });
+  }
+  if (typeof requestFingerprint !== "string" || !requestFingerprintPattern.test(requestFingerprint)) {
+    throw new Error("idempotent job creation requires a SHA-256 request fingerprint");
+  }
+
+  const assertMatchingFingerprint = (expectedFingerprint) => {
+    if (expectedFingerprint !== requestFingerprint) {
+      throw new HttpError(409, "同じIdempotency-Keyが異なる生成内容に使用されています");
+    }
+  };
+
+  const findExistingJob = () => {
+    const binding = idempotencyMap.get(idempotencyKey);
+    if (!binding) return null;
+    const job = jobsMap.get(binding.jobId) ?? null;
+    if (!job) {
+      idempotencyMap.delete(idempotencyKey);
+      return null;
+    }
+    assertMatchingFingerprint(binding.requestFingerprint);
+    return job;
+  };
+  const existing = findExistingJob();
+  if (existing) return { job: existing, created: false };
+
+  const inFlight = inflightMap.get(idempotencyKey);
+  if (inFlight) {
+    assertMatchingFingerprint(inFlight.requestFingerprint);
+    const result = await inFlight.creation;
+    return { job: result.job, created: false };
+  }
+
+  const creation = gate.run(async () => {
+    const admittedExisting = findExistingJob();
+    if (admittedExisting) return { job: admittedExisting, created: false };
+    await beforeCreate();
+    const job = await create();
+    idempotencyMap.set(idempotencyKey, { jobId: job.id, requestFingerprint });
+    return { job, created: true };
+  });
+  const inFlightBinding = { requestFingerprint, creation };
+  inflightMap.set(idempotencyKey, inFlightBinding);
+  try {
+    return await creation;
+  } finally {
+    if (inflightMap.get(idempotencyKey) === inFlightBinding) {
+      inflightMap.delete(idempotencyKey);
+    }
+  }
 }
 
 const jobAdmissionGate = createJobAdmissionGate({
@@ -931,6 +1033,7 @@ export async function restorePersistedJobs({
   root = workRoot,
   jobsMap = jobs,
   queueList = queue,
+  idempotencyMap = designJobIdsByIdempotencyKey,
 } = {}) {
   const restored = [];
   const pending = [];
@@ -959,6 +1062,24 @@ export async function restorePersistedJobs({
         pending.push(job);
       }
       jobsMap.set(job.id, job);
+      if (job.type === "design"
+        && typeof job.idempotencyKey === "string"
+        && jobIdPattern.test(job.idempotencyKey.trim())
+        && typeof job.requestFingerprint === "string"
+        && requestFingerprintPattern.test(job.requestFingerprint.trim())) {
+        const key = job.idempotencyKey.trim().toLowerCase();
+        const requestFingerprint = job.requestFingerprint.trim().toLowerCase();
+        job.idempotencyKey = key;
+        job.requestFingerprint = requestFingerprint;
+        const mappedBinding = idempotencyMap.get(key);
+        const mappedJob = jobsMap.get(mappedBinding?.jobId);
+        const mappedCreatedAt = String(mappedJob?.createdAt ?? "");
+        const restoredCreatedAt = String(job.createdAt ?? "");
+        if (!mappedJob || restoredCreatedAt.localeCompare(mappedCreatedAt) < 0
+          || restoredCreatedAt === mappedCreatedAt && job.id.localeCompare(mappedJob.id) < 0) {
+          idempotencyMap.set(key, { jobId: job.id, requestFingerprint });
+        }
+      }
       restored.push(job.id);
     } catch (error) {
       console.warn(`ジョブ状態を復元できません (${entry.name}): ${error instanceof Error ? error.message : error}`);
@@ -1100,11 +1221,27 @@ function extensionForMimeType(mimeType) {
   return ".png";
 }
 
-async function createJob(input) {
-  return jobAdmissionGate.run(() => createJobAfterAdmission(input));
+async function createJob(input, {
+  idempotencyKey = null,
+  requestFingerprint = null,
+  beforeCreate = () => {},
+} = {}) {
+  return runIdempotentJobCreation({
+    idempotencyKey,
+    requestFingerprint,
+    gate: jobAdmissionGate,
+    jobsMap: jobs,
+    idempotencyMap: designJobIdsByIdempotencyKey,
+    inflightMap: designJobCreationsByIdempotencyKey,
+    beforeCreate,
+    create: () => createJobAfterAdmission(input, { idempotencyKey, requestFingerprint }),
+  });
 }
 
-async function createJobAfterAdmission(input) {
+async function createJobAfterAdmission(input, {
+  idempotencyKey = null,
+  requestFingerprint = null,
+} = {}) {
   const id = randomUUID();
   const directory = join(workRoot, id);
   const candidateFolds = input.candidates;
@@ -1218,6 +1355,8 @@ async function createJobAfterAdmission(input) {
     evaluationLimit: unlimitedCodexMode ? evaluationLimit : (finalStateMode ? 4 : maxCycles),
     evaluatedNodes: 0,
     designMode: jobDesignMode,
+    ...(idempotencyKey ? { idempotencyKey } : {}),
+    ...(requestFingerprint ? { requestFingerprint } : {}),
     bestScore: null,
     status: "queued",
     message: "処理待ち",
@@ -3451,10 +3590,15 @@ async function handle(request, response) {
     return;
   }
   if (request.method === "POST" && url.pathname === "/jobs") {
+    const idempotencyKey = validateIdempotencyKey(request.headers["idempotency-key"]);
     const input = validateJobInput(await readJson(request));
-    consumeSubmissionQuota(request);
-    const job = await createJob(input);
-    send(response, 202, { ok: true, job: publicJob(job) }, origin);
+    const requestFingerprint = idempotencyKey ? fingerprintDesignRequest(input) : null;
+    const { job, created } = await createJob(input, {
+      idempotencyKey,
+      requestFingerprint,
+      beforeCreate: () => consumeSubmissionQuota(request),
+    });
+    send(response, created ? 202 : 200, { ok: true, job: publicJob(job) }, origin);
     return;
   }
   const cancelMatch = url.pathname.match(/^\/jobs\/([0-9a-f-]+)\/cancel$/i);

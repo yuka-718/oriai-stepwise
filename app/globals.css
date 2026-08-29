@@ -6,6 +6,7 @@
   --canvas: #f1f3f7;
   --surface: #ffffff;
   --red: #ff4a36;
+  --error: #b42318;
   --blue: #2457ff;
   --yellow: #ffd126;
   --green: #00a878;
@@ -85,20 +86,26 @@ a { color: inherit; text-decoration: none; }
   box-shadow: var(--shadow);
 }
 .promptField { min-width: 0; padding: 25px 27px 20px; border-right: 1px solid var(--line); }
-.promptField > span { display: block; margin-bottom: 12px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .08em; }
-.promptField > .fieldError { color: var(--red); }
+.promptField > .fieldLabel { display: block; margin-bottom: 12px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .08em; }
+.fieldError { color: var(--error); font-size: 11px; font-weight: 800; line-height: 1.35; letter-spacing: .02em; }
+.promptField > .fieldError { display: block; margin: 6px 0 0; }
 .promptField textarea { width: 100%; height: 92px; padding: 0; resize: none; border: 0; outline: 0; background: transparent; font-size: clamp(19px, 2.1vw, 31px); line-height: 1.45; font-weight: 750; letter-spacing: -.035em; }
 .promptField textarea::placeholder { color: var(--muted); opacity: .78; }
+.promptField textarea[aria-invalid="true"] { box-shadow: inset 0 -2px 0 var(--error); }
 
 .uploadField { position: relative; min-width: 0; border-right: 1px solid var(--line); }
 .uploadField > input { position: absolute; width: 1px; height: 1px; opacity: 0; }
 .uploadField > label { width: 100%; height: 100%; min-height: 164px; padding: 18px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 13px; text-align: center; transition: background .18s ease; }
 .uploadField > label:hover { background: linear-gradient(135deg, rgba(36, 87, 255, .08), rgba(0, 168, 120, .08)); }
+.uploadField:has(> input[aria-invalid="true"]) > label { box-shadow: inset 0 0 0 2px var(--error); }
 .uploadField b { display: grid; place-items: center; width: 44px; height: 44px; border: 0; border-radius: 7px; background: var(--blue); box-shadow: 7px 7px 0 var(--yellow); color: #fff; font: 400 25px/1 sans-serif; }
 .uploadField span { max-width: 180px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); font-size: 11px; font-weight: 750; }
 .uploadField img { width: 96px; height: 86px; border: 3px solid #fff; border-radius: 7px; object-fit: cover; box-shadow: 7px 7px 0 rgba(36, 87, 255, .18); }
+.uploadField > .fieldError { position: absolute; right: 12px; bottom: 8px; left: 12px; z-index: 2; margin: 0; text-align: center; white-space: normal; }
 .removeImage { position: absolute; top: 10px; right: 10px; z-index: 2; width: 30px; height: 30px; border: 1px solid var(--line); border-radius: 5px; background: #fff; color: var(--red); font-size: 17px; line-height: 1; }
 .removeImage:hover { background: #fff0ed; }
+
+.formError { grid-column: 1 / -1; margin: 0; padding: 10px 18px; border-top: 1px solid rgba(180, 35, 24, .24); background: #fff4f2; color: var(--error); font-size: 12px; font-weight: 800; line-height: 1.5; }
 
 .generate {
   position: relative;
