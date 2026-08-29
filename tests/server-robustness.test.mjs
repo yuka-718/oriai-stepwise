@@ -8,6 +8,8 @@ import test, { after } from "node:test";
 process.env.ORI_AI_LOCAL_HOST = "127.0.0.1";
 process.env.ORI_AI_LOCAL_PORT = "0";
 process.env.ORI_AI_RESTORE_JOBS = "0";
+// A legacy environment override must not change the public new-job default.
+process.env.ORI_AI_DESIGN_MODE = "regeneration";
 
 const {
   assertSuccessfulFinalFoldCalculation,
@@ -340,12 +342,15 @@ test("the HTTP jobs endpoint returns the original job only for the same fingerpr
   }
 });
 
-test("the HTTP jobs endpoint rejects legacy loop mode and defaults new requests to stepwise", async () => {
+test("the HTTP jobs endpoint only accepts default or explicit stepwise jobs", async () => {
   const root = await mkdtemp(join(tmpdir(), "oriai-http-stepwise-default-"));
   try {
     const id = "99999999-9999-4999-8999-999999999999";
     const key = "55555555-5555-4555-8555-555555555555";
     const directory = join(root, id);
+    const explicitId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    const explicitKey = "66666666-6666-4666-8666-666666666666";
+    const explicitDirectory = join(root, explicitId);
     const fold = {
       file_spec: 1.2,
       vertices_coords: [[0, 0], [1, 0], [1, 1], [0, 1]],
@@ -379,6 +384,33 @@ test("the HTTP jobs endpoint rejects legacy loop mode and defaults new requests 
       error: null,
       cancelRequested: false,
     });
+    const explicitBody = { ...body, designMode: "codex_mcp_stepwise" };
+    const explicitRequestFingerprint = fingerprintDesignRequest({
+      prompt: "鶴",
+      fold,
+      candidates: [fold],
+      goal: null,
+      referenceImage: null,
+      pipeline: null,
+      designMode: "codex_mcp_stepwise",
+    });
+    await mkdir(explicitDirectory, { recursive: true });
+    await persistJobState({
+      id: explicitId,
+      type: "design",
+      directory: explicitDirectory,
+      designMode: "codex_mcp_stepwise",
+      idempotencyKey: explicitKey,
+      requestFingerprint: explicitRequestFingerprint,
+      status: "done",
+      message: "完了",
+      createdAt: "2026-01-01T00:00:00.000Z",
+      startedAt: "2026-01-01T00:00:01.000Z",
+      completedAt: "2026-01-01T00:00:02.000Z",
+      result: {},
+      error: null,
+      cancelRequested: false,
+    });
     await restorePersistedJobs({ root, queueList: [] });
 
     const address = server.address();
@@ -392,6 +424,19 @@ test("the HTTP jobs endpoint rejects legacy loop mode and defaults new requests 
     assert.equal(legacy.status, 400);
     assert.match((await legacy.json()).error, /未対応の設計モード/);
 
+    for (const pipelineBody of [
+      { ...body, pipeline: "corigami_final_state_v1" },
+      { ...body, designMode: "codex_mcp_stepwise", pipeline: "corigami_final_state_v1" },
+    ]) {
+      const response = await fetch(`${origin}/jobs`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(pipelineBody),
+      });
+      assert.equal(response.status, 400);
+      assert.match((await response.json()).error, /未対応の生成パイプライン/);
+    }
+
     const defaulted = await fetch(`${origin}/jobs`, {
       method: "POST",
       headers: { "Content-Type": "application/json", "Idempotency-Key": key },
@@ -403,6 +448,17 @@ test("the HTTP jobs endpoint rejects legacy loop mode and defaults new requests 
     assert.equal(payload.job.progress.mode, "codex_mcp_stepwise");
     assert.equal(payload.job.progress.batchSize, 1);
     assert.equal(payload.job.progress.codexExecution.freshContextPerEvaluation, true);
+
+    const explicit = await fetch(`${origin}/jobs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", "Idempotency-Key": explicitKey },
+      body: JSON.stringify(explicitBody),
+    });
+    assert.equal(explicit.status, 200);
+    const explicitPayload = await explicit.json();
+    assert.equal(explicitPayload.job.id, explicitId);
+    assert.equal(explicitPayload.job.progress.mode, "codex_mcp_stepwise");
+    assert.equal(explicitPayload.job.progress.batchSize, 1);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -444,6 +500,9 @@ test("new design jobs default to isolated one-step mode and reject explicit lega
     unlimitedCodexMode: true,
   });
   assert.deepEqual(resolveDesignModeSelection(), defaultSelection);
+  assert.deepEqual(resolveDesignModeSelection({ defaultMode: "regeneration" }), defaultSelection);
+  assert.deepEqual(resolveDesignModeSelection({ defaultMode: "crease_step_search" }), defaultSelection);
+  assert.deepEqual(resolveDesignModeSelection({ defaultMode: "corigami_final_state_v1" }), defaultSelection);
   const stepwise = resolveDesignModeSelection({
     defaultMode: "codex_mcp_loop",
     requestedMode: "codex_mcp_stepwise",
@@ -465,6 +524,17 @@ test("new design jobs default to isolated one-step mode and reject explicit lega
   assert.throws(
     () => resolveDesignModeSelection({ requestedMode: "untrusted_mode" }),
     (error) => error?.status === 400,
+  );
+  assert.throws(
+    () => resolveDesignModeSelection({ pipeline: "corigami_final_state_v1" }),
+    (error) => error?.status === 400 && /生成パイプライン/.test(error.message),
+  );
+  assert.throws(
+    () => resolveDesignModeSelection({
+      requestedMode: "codex_mcp_stepwise",
+      pipeline: "corigami_final_state_v1",
+    }),
+    (error) => error?.status === 400 && /生成パイプライン/.test(error.message),
   );
 });
 

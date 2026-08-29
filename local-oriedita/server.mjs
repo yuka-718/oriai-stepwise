@@ -79,9 +79,7 @@ const evaluationLimit = null;
 const maxCycles = 10;
 const targetScore = 99;
 const configuredDesignMode = process.env.ORI_AI_DESIGN_MODE?.trim();
-const designMode = configuredDesignMode === "regeneration"
-  || configuredDesignMode === "crease_step_search"
-  || configuredDesignMode === "codex_mcp_stepwise"
+const designMode = configuredDesignMode === "codex_mcp_stepwise"
   ? configuredDesignMode
   : "codex_mcp_stepwise";
 const stepBranchFactor = Math.min(3, Math.max(1, Number.parseInt(process.env.ORI_AI_STEP_BRANCH_FACTOR ?? "2", 10)));
@@ -165,6 +163,9 @@ export function resolveDesignModeSelection({
   defaultMode = designMode,
   pipeline = null,
 } = {}) {
+  if (pipeline != null) {
+    throw new HttpError(400, "未対応の生成パイプラインです");
+  }
   let normalizedRequestedMode = null;
   if (requestedMode != null) {
     if (typeof requestedMode !== "string" || !requestableDesignModes.has(requestedMode)) {
@@ -172,9 +173,8 @@ export function resolveDesignModeSelection({
     }
     normalizedRequestedMode = requestedMode;
   }
-  const mode = pipeline === "corigami_final_state_v1"
-    ? "corigami_final_state_v1"
-    : normalizedRequestedMode ?? (defaultMode === "codex_mcp_loop" ? "codex_mcp_stepwise" : defaultMode);
+  const mode = normalizedRequestedMode
+    ?? (requestableDesignModes.has(defaultMode) ? defaultMode : "codex_mcp_stepwise");
   const batchSize = codexBatchSizeForMode(mode);
   return {
     mode,
@@ -1199,7 +1199,7 @@ function validateJobInput(value) {
   }
   const goal = value?.goal && typeof value.goal === "object" ? value.goal : null;
   const pipeline = value?.pipeline == null ? null : String(value.pipeline);
-  if (pipeline !== null && pipeline !== "corigami_final_state_v1") {
+  if (pipeline !== null) {
     throw new HttpError(400, "未対応の生成パイプラインです");
   }
   const requestedDesignMode = value?.designMode ?? null;
