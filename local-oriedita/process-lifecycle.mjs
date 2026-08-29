@@ -98,7 +98,6 @@ export function observeChildProcess(child) {
           resolve(value);
         };
         const timer = setTimeout(() => finish(null), timeout);
-        timer.unref?.();
         void termination.then(finish);
       });
     },
