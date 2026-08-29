@@ -98,5 +98,7 @@ test("scopes GitHub Pages assets, metadata, discovery, and browser state to oria
   assert.match(pagesScript, /GITHUB_PAGES_BASE_PATH/);
   assert.match(workflow, /steps\.pages\.outputs\.base_path/);
   assert.match(workflow, /steps\.pages\.outputs\.base_url/);
+  assert.match(workflow, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
+  assert.doesNotMatch(workflow, /api\.github\.com\/repos\/yuka-718\/oriai-stepwise\/contents\/oriedita-upstream\.json/);
   assert.match(tunnelSupervisor, /yuka-718\/oriai-stepwise/);
 });
