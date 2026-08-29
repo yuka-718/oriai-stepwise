@@ -49,7 +49,7 @@ test("application waits for a 99-point Codex and Oriedita result before showing 
   ]);
 
   assert.match(page, /API_DISCOVERY_URL/);
-  assert.match(page, /api\.github\.com\/repos\/yuka-718\/oriai-stepwise\/contents\/oriedita-upstream\.json/);
+  assert.match(page, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
   assert.match(page, /application\/vnd\.github\.raw\+json/);
   assert.match(page, /candidateToFold/);
   assert.match(page, /generateCandidates/);

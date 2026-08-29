@@ -91,7 +91,7 @@ test("scopes GitHub Pages assets, metadata, discovery, and browser state to oria
     readFile(new URL("../scripts/oriedita-tunnel-supervisor.mjs", import.meta.url), "utf8"),
   ]);
 
-  assert.match(page, /yuka-718\/oriai-stepwise\/contents\/oriedita-upstream\.json/);
+  assert.match(page, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
   assert.match(page, /oriai-stepwise:active-codex-job:v1/);
   assert.match(layout, /https:\/\/yuka-718\.github\.io\/oriai-stepwise\//);
   assert.match(pagesScript, /fallbackBasePath = "\/oriai-stepwise"/);

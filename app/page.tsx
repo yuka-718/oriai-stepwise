@@ -22,7 +22,7 @@ import {
 } from "./origami-engine";
 
 const API_DISCOVERY_URL = process.env.NEXT_PUBLIC_ORIEDITA_DISCOVERY_URL?.trim()
-  || "https://api.github.com/repos/yuka-718/oriai-stepwise/contents/oriedita-upstream.json?ref=runtime";
+  || "https://raw.githubusercontent.com/yuka-718/oriai-stepwise/runtime/oriedita-upstream.json";
 const API_RECONNECT_ATTEMPTS = 30;
 const API_RECONNECT_DELAY_MS = 2_000;
 const ACTIVE_JOB_STORAGE_KEY = "oriai-stepwise:active-codex-job:v1";
