@@ -78,27 +78,33 @@ test("connects to the dynamic Codex and Oriedita API and makes input errors visi
   assert.match(server, /ORI_AI_MAX_JOBS_PER_WINDOW \?\? "0"/);
   assert.match(server, /if \(maxJobsPerWindow === 0\) return;/);
   assert.match(envExample, /^ORI_AI_MAX_JOBS_PER_WINDOW=0$/m);
-  assert.match(envExample, /yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
+  assert.match(envExample, /yuka-718\/oriai-stepwise\/refs\/heads\/runtime\/oriedita-upstream\.json/);
   assert.match(oracleDeploy, /ORI_AI_MAX_JOBS_PER_WINDOW=0/);
 });
 
 test("scopes GitHub Pages assets, metadata, discovery, and browser state to oriai-stepwise", async () => {
-  const [page, layout, pagesScript, workflow, tunnelSupervisor] = await Promise.all([
+  const [page, layout, styles, pagesScript, workflow, tunnelSupervisor] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../scripts/prepare-github-pages.mjs", import.meta.url), "utf8"),
     readFile(new URL("../.github/workflows/deploy-pages.yml", import.meta.url), "utf8"),
     readFile(new URL("../scripts/oriedita-tunnel-supervisor.mjs", import.meta.url), "utf8"),
   ]);
 
-  assert.match(page, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
+  assert.match(page, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/refs\/heads\/runtime\/oriedita-upstream\.json/);
   assert.match(page, /oriai-stepwise:active-codex-job:v1/);
   assert.match(layout, /https:\/\/yuka-718\.github\.io\/oriai-stepwise\//);
+  assert.match(styles, /\.uploadField:has\(> input:focus-visible\) > label/);
+  assert.match(styles, /outline: 3px solid var\(--blue\)/);
+  assert.match(styles, /textarea::placeholder \{ color: var\(--muted\); opacity: \.78; \}/);
+  assert.match(layout, /Orieditaの2D平坦折りで検証/);
+  assert.doesNotMatch(layout, /完成形3Dモデル/);
   assert.match(pagesScript, /fallbackBasePath = "\/oriai-stepwise"/);
   assert.match(pagesScript, /GITHUB_PAGES_BASE_PATH/);
   assert.match(workflow, /steps\.pages\.outputs\.base_path/);
   assert.match(workflow, /steps\.pages\.outputs\.base_url/);
-  assert.match(workflow, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
+  assert.match(workflow, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/refs\/heads\/runtime\/oriedita-upstream\.json/);
   assert.doesNotMatch(workflow, /api\.github\.com\/repos\/yuka-718\/oriai-stepwise\/contents\/oriedita-upstream\.json/);
   assert.match(tunnelSupervisor, /yuka-718\/oriai-stepwise/);
 });

@@ -89,6 +89,7 @@ test("installed services keep legacy design mode and publish a rate-limited shar
 
   assert.match(tunnelService, /ORI_AI_TUNNEL_REGISTRY_REPO<\/key><string>yuka-718\/oriai-stepwise/);
   assert.match(tunnelService, /ORI_AI_TUNNEL_REGISTRY_MIRROR_REPOS<\/key><string>yuka-718\/oriai/);
+  assert.match(tunnelService, /ORI_AI_TUNNEL_PROVIDER<\/key><string>cloudflare<\/string>/);
   assert.match(localService, /ORI_AI_DESIGN_MODE<\/key>\s*<string>codex_mcp_loop<\/string>/);
   assert.match(localService, /ORI_AI_MAX_JOBS_PER_WINDOW<\/key>\s*<string>3<\/string>/);
   assert.match(localService, /ORI_AI_RATE_WINDOW_MS<\/key>\s*<string>21600000<\/string>/);

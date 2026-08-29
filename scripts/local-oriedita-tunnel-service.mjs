@@ -63,7 +63,7 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
     <key>ORI_AI_SSH</key><string>${xml(ssh)}</string>
     <key>ORI_AI_LOCALTUNNEL</key><string>${xml(localtunnel)}</string>
     <key>ORI_AI_LOCALTUNNEL_SUBDOMAIN</key><string>oriai-ito-pj-2026</string>
-    <key>ORI_AI_TUNNEL_PROVIDER</key><string>localhostrun</string>
+    <key>ORI_AI_TUNNEL_PROVIDER</key><string>cloudflare</string>
     <key>ORI_AI_TUNNEL_REGISTRY_REPO</key><string>yuka-718/oriai-stepwise</string>
     <key>ORI_AI_TUNNEL_REGISTRY_MIRROR_REPOS</key><string>yuka-718/oriai</string>
   </dict>

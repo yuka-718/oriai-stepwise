@@ -10,6 +10,7 @@ import {
   assertNovelCodexActionKeys,
   assertCodexOperationSnapshot,
   assertInitialCreasesPreserved,
+  assertOneStepCodexEvidenceOrder,
   assertSuccessfulStepEvaluations,
   buildCodexLoopPrompt,
   codexActionKey,
@@ -477,6 +478,77 @@ test("a rejected first step rolls back to the preseeded committed FOLD", () => {
   }), [false]);
 });
 
+test("strict one-step order rejects otherwise-complete evidence without the starting FOLD open", () => {
+  const tracker = createCodexOperationTracker({ maximumIterations: 1 });
+  ingestSuccessfulIteration(tracker, 0);
+  tracker.ingestLine(mcpEvent("export_file", { arguments: { path: "/tmp/job/best.fold" } }));
+  const snapshot = tracker.snapshot();
+  assert.doesNotThrow(() => assertCodexOperationSnapshot(snapshot, 1));
+  assert.deepEqual(assertCodexDecisionEvidence([
+    { step: 1, score: 80, accepted: true },
+  ], snapshot, {
+    finalFoldPath: "/tmp/job/best.fold",
+    startingBestScore: 79,
+  }), [true]);
+  assert.throws(() => assertOneStepCodexEvidenceOrder(snapshot, {
+    initialFoldPath: "/tmp/job/start.fold",
+    finalFoldPath: "/tmp/job/best.fold",
+    accepted: true,
+  }), /開始FOLD/);
+});
+
+test("strict one-step order rejects a best-FOLD save made before calculation and image review", () => {
+  const tracker = createCodexOperationTracker({ maximumIterations: 1 });
+  tracker.ingestLine(mcpEvent("open_file", { arguments: { path: "/tmp/job/start.fold" } }));
+  ingestVerifiedAdd(tracker, 0);
+  tracker.ingestLine(mcpEvent("export_file", { arguments: { path: "/tmp/job/best.fold" } }));
+  tracker.ingestLine(mcpEvent("calculate_fold", {
+    result: { structured_content: { started: true, violationCount: 0 } },
+  }));
+  tracker.ingestLine(mcpEvent("get_folded_figure", {
+    result: { content: [{ type: "image", data: "png", mimeType: "image/png" }] },
+  }));
+  const snapshot = tracker.snapshot();
+  assert.doesNotThrow(() => assertCodexOperationSnapshot(snapshot, 1));
+  assert.deepEqual(assertCodexDecisionEvidence([
+    { step: 1, score: 80, accepted: true },
+  ], snapshot, {
+    finalFoldPath: "/tmp/job/best.fold",
+    startingBestScore: 79,
+  }), [true]);
+  assert.throws(() => assertOneStepCodexEvidenceOrder(snapshot, {
+    initialFoldPath: "/tmp/job/start.fold",
+    finalFoldPath: "/tmp/job/best.fold",
+    accepted: true,
+  }), /画像評価より前/);
+});
+
+test("strict one-step order accepts open, CP mutation, calculation, image, then save", () => {
+  const tracker = createCodexOperationTracker({ maximumIterations: 1 });
+  tracker.ingestLine(mcpEvent("open_file", { arguments: { path: "/tmp/job/start.fold" } }));
+  ingestSuccessfulIteration(tracker, 0);
+  tracker.ingestLine(mcpEvent("export_file", { arguments: { path: "/tmp/job/best.fold" } }));
+  const snapshot = tracker.snapshot();
+  assert.deepEqual(assertOneStepCodexEvidenceOrder(snapshot, {
+    initialFoldPath: "/tmp/job/start.fold",
+    finalFoldPath: "/tmp/job/best.fold",
+    accepted: true,
+  }), [1, 2, 3, 4, 5, 6, 7]);
+});
+
+test("strict one-step order accepts open, CP mutation, calculation, image, then rollback", () => {
+  const tracker = createCodexOperationTracker({ maximumIterations: 1 });
+  tracker.ingestLine(mcpEvent("open_file", { arguments: { path: "/tmp/job/start.fold" } }));
+  ingestSuccessfulIteration(tracker, 0);
+  tracker.ingestLine(mcpEvent("open_file", { arguments: { path: "/tmp/job/best.fold" } }));
+  const snapshot = tracker.snapshot();
+  assert.deepEqual(assertOneStepCodexEvidenceOrder(snapshot, {
+    initialFoldPath: "/tmp/job/start.fold",
+    finalFoldPath: "/tmp/job/best.fold",
+    accepted: false,
+  }), [1, 2, 3, 4, 5, 6, 7]);
+});
+
 test("action callbacks persist an inflight key before recording verified CP-change evidence", async () => {
   const records = [];
   const tracker = createCodexOperationTracker({
@@ -792,6 +864,7 @@ test("Codex exec uses JSONL with isolated stdout parsing and noninteractive safe
   assert.match(source, /if \(timedOut\) rejectRun/);
   assert.match(source, /assertCodexOperationSnapshot\(operationSnapshot/);
   assert.match(source, /assertCodexDecisionEvidence\(factualSteps, operationSnapshot/);
+  assert.match(source, /if \(boundedIterations === 1\)[\s\S]*?assertOneStepCodexEvidenceOrder\(operationSnapshot/);
 });
 
 test("secure staging keeps Oriedita files outside the Codex job and atomically replaces hostile result symlinks", async (t) => {

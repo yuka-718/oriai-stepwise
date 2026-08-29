@@ -88,7 +88,7 @@ a { color: inherit; text-decoration: none; }
 .promptField > span { display: block; margin-bottom: 12px; color: var(--muted); font-size: 11px; font-weight: 800; letter-spacing: .08em; }
 .promptField > .fieldError { color: var(--red); }
 .promptField textarea { width: 100%; height: 92px; padding: 0; resize: none; border: 0; outline: 0; background: transparent; font-size: clamp(19px, 2.1vw, 31px); line-height: 1.45; font-weight: 750; letter-spacing: -.035em; }
-.promptField textarea::placeholder { color: rgba(89, 101, 122, .38); }
+.promptField textarea::placeholder { color: var(--muted); opacity: .78; }
 
 .uploadField { position: relative; min-width: 0; border-right: 1px solid var(--line); }
 .uploadField > input { position: absolute; width: 1px; height: 1px; opacity: 0; }
@@ -311,7 +311,8 @@ a { color: inherit; text-decoration: none; }
 .scopeNote { min-height: 58px; padding: 12px 22px; border-top: 1px solid var(--line); background: #fffdf4; display: flex; align-items: center; gap: 16px; color: var(--muted); font-size: 9px; line-height: 1.55; }
 .scopeNote strong { flex: 0 0 auto; color: #9a6d00; font-size: 9px; }
 
-button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visible, label:has(input:focus-visible) { outline: 3px solid var(--yellow); outline-offset: 3px; }
+button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visible, .uploadField:has(> input:focus-visible) > label { outline: 3px solid var(--blue); outline-offset: 3px; }
+.uploadField:has(> input:focus-visible) > label { outline-offset: -5px; }
 
 @media (max-width: 900px) {
   .promptArea { grid-template-columns: 1fr 190px; }

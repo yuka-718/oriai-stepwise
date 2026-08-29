@@ -22,9 +22,10 @@ import {
 } from "./origami-engine";
 
 const API_DISCOVERY_URL = process.env.NEXT_PUBLIC_ORIEDITA_DISCOVERY_URL?.trim()
-  || "https://raw.githubusercontent.com/yuka-718/oriai-stepwise/runtime/oriedita-upstream.json";
-const API_RECONNECT_ATTEMPTS = 30;
+  || "https://raw.githubusercontent.com/yuka-718/oriai-stepwise/refs/heads/runtime/oriedita-upstream.json";
+const API_RECONNECT_WINDOW_MS = 330_000;
 const API_RECONNECT_DELAY_MS = 2_000;
+const API_REQUEST_TIMEOUT_MS = 8_000;
 const ACTIVE_JOB_STORAGE_KEY = "oriai-stepwise:active-codex-job:v1";
 const STEPWISE_DESIGN_MODE = "codex_mcp_stepwise" as const;
 let cachedApiOrigin = "";
@@ -108,7 +109,7 @@ async function resolveApiOrigin(force = false) {
   }
   const discovery = new URL(API_DISCOVERY_URL);
   discovery.searchParams.set("refresh", String(Date.now()));
-  const response = await fetch(discovery, {
+  const response = await fetchWithTimeout(discovery, {
     cache: "no-store",
     headers: { Accept: "application/vnd.github.raw+json" },
   });
@@ -122,6 +123,16 @@ async function resolveApiOrigin(force = false) {
 }
 
 const delay = (milliseconds: number) => new Promise((resolve) => window.setTimeout(resolve, milliseconds));
+
+async function fetchWithTimeout(input: RequestInfo | URL, init?: RequestInit) {
+  const controller = new AbortController();
+  const timer = window.setTimeout(() => controller.abort(), API_REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } finally {
+    window.clearTimeout(timer);
+  }
+}
 
 function readStoredActiveJob() {
   try {
@@ -157,17 +168,20 @@ function createDisplayResult(completed: OrieditaResult, description: string): Di
 
 async function waitForApiOrigin() {
   let lastError: unknown = null;
-  for (let attempt = 0; attempt < API_RECONNECT_ATTEMPTS; attempt += 1) {
+  const deadline = Date.now() + API_RECONNECT_WINDOW_MS;
+  for (let attempt = 0; Date.now() < deadline; attempt += 1) {
     try {
       const origin = await resolveApiOrigin(attempt > 0);
-      const response = await fetch(`${origin}/health`, { mode: "cors", cache: "no-store" });
+      const response = await fetchWithTimeout(`${origin}/health`, { mode: "cors", cache: "no-store" });
       if (response.ok) return origin;
       lastError = new Error("生成サーバーが再接続中です");
     } catch (error) {
       lastError = error;
     }
     cachedApiOrigin = "";
-    if (attempt + 1 < API_RECONNECT_ATTEMPTS) await delay(API_RECONNECT_DELAY_MS);
+    if (Date.now() < deadline) {
+      await delay(Math.min(API_RECONNECT_DELAY_MS, Math.max(0, deadline - Date.now())));
+    }
   }
   throw new Error(
     lastError instanceof Error && !/Failed to fetch/i.test(lastError.message)
@@ -191,7 +205,7 @@ async function apiFetch(path: string, init?: RequestInit) {
   for (let attempt = 0; attempt < 6; attempt += 1) {
     try {
       const origin = await resolveApiOrigin(attempt > 0);
-      const response = await fetch(`${origin}${path}`, { ...init, mode: "cors", cache: "no-store" });
+      const response = await fetchWithTimeout(`${origin}${path}`, { ...init, mode: "cors", cache: "no-store" });
       if (response.status >= 500 && attempt < 5) {
         cachedApiOrigin = "";
         await delay(1_000);

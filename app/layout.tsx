@@ -10,7 +10,7 @@ export const metadata: Metadata = {
   metadataBase: new URL(publicUrl),
   title: "ORIAI — 折り紙生成プロトタイプ",
   description:
-    "プロンプトと参考画像から、折り紙の展開図と完成形3Dモデルを表示する研究プロトタイプ。",
+    "Codexが折り線を一手ずつ提案し、Orieditaの2D平坦折りで検証する折り紙生成プロトタイプ。",
   authors: [{ name: "伊藤夕夏" }],
   alternates: { canonical: publicUrl },
   openGraph: {
@@ -18,14 +18,14 @@ export const metadata: Metadata = {
     locale: "ja_JP",
     url: publicUrl,
     siteName: "ORIAI",
-    title: "ORIAI — 展開図と完成形3Dを生成",
-    description: "プロンプトと参考画像を入力して、折り紙の展開図と完成形3Dモデルを表示します。",
+    title: "ORIAI — 折り線を一手ずつ生成・検証",
+    description: "Codexが折り線を一手ずつ提案し、Orieditaの2D平坦折りで検証。同じ展開図の形状プレビューを表示します。",
     images: [{ url: "og-oriai-vivid.png", width: 1732, height: 908, alt: "ORIAI 折り紙生成プロトタイプ" }],
   },
   twitter: {
     card: "summary_large_image",
-    title: "ORIAI — 展開図と完成形3Dを生成",
-    description: "プロンプトと参考画像を入力して、折り紙の展開図と完成形3Dモデルを表示します。",
+    title: "ORIAI — 折り線を一手ずつ生成・検証",
+    description: "Codexが折り線を一手ずつ提案し、Orieditaの2D平坦折りで検証。同じ展開図の形状プレビューを表示します。",
     images: ["og-oriai-vivid.png"],
   },
 };

@@ -531,6 +531,7 @@ export function createCodexOperationTracker({
   const iterations = [];
   const openedPaths = [];
   const exportedPaths = [];
+  const operationSequence = [];
   const observedTools = new Set();
   const previousActions = new Set(previousActionKeys instanceof Set ? previousActionKeys : previousActionKeys ?? []);
   const batchActions = new Set();
@@ -563,6 +564,13 @@ export function createCodexOperationTracker({
     if (observed?.tool) observedTools.add(observed.tool);
     const item = completedOrieditaCall(event);
     if (!item) return false;
+    const eventSequence = operationSequence.length + 1;
+    const sequenceEvent = {
+      sequence: eventSequence,
+      tool: item.tool,
+      completed: toolCallSucceeded(item),
+    };
+    operationSequence.push(sequenceEvent);
 
     if (item.tool === "get_crease_pattern") {
       counts.get_crease_pattern += 1;
@@ -570,8 +578,14 @@ export function createCodexOperationTracker({
       const pattern = {
         ...creasePatternResult(item),
         sequence: creasePatternSequence,
+        event_sequence: eventSequence,
         document_revision: documentRevision,
       };
+      Object.assign(sequenceEvent, {
+        evidence_completed: pattern.completed,
+        line_count: pattern.line_count,
+        hash: pattern.hash,
+      });
       const iteration = iterations[currentIterationIndex];
       if (iteration?.add_line
           && iteration.calculate_fold == null
@@ -607,7 +621,14 @@ export function createCodexOperationTracker({
       counts.add_line += 1;
       currentIterationIndex = counts.add_line - 1;
       if (currentIterationIndex < maximum) {
-        const addLine = addLineResult(item);
+        const addLine = {
+          ...addLineResult(item),
+          event_sequence: eventSequence,
+        };
+        Object.assign(sequenceEvent, {
+          action_key: addLine.action_key,
+          response_matches_request: addLine.response_matches_request,
+        });
         const actionKey = addLine.action_key;
         iterations[currentIterationIndex] = {
           step: currentIterationIndex + 1,
@@ -647,7 +668,14 @@ export function createCodexOperationTracker({
     } else if (item.tool === "calculate_fold") {
       counts.calculate_fold += 1;
       const iteration = iterations[currentIterationIndex];
-      const result = foldCalculationResult(item);
+      const result = {
+        ...foldCalculationResult(item),
+        event_sequence: eventSequence,
+      };
+      Object.assign(sequenceEvent, {
+        started: result.started,
+        violation_count: result.violation_count,
+      });
       if (iteration && iteration.get_folded_figure == null
         && (iteration.calculate_fold == null || iteration.calculate_fold.completed !== true)) {
         iteration.calculate_fold = result;
@@ -655,7 +683,14 @@ export function createCodexOperationTracker({
     } else if (item.tool === "get_folded_figure") {
       counts.get_folded_figure += 1;
       const iteration = iterations[currentIterationIndex];
-      const result = foldedFigureResult(item);
+      const result = {
+        ...foldedFigureResult(item),
+        event_sequence: eventSequence,
+      };
+      Object.assign(sequenceEvent, {
+        image_present: result.image_present,
+        mime_type: result.mime_type,
+      });
       if (iteration && iteration.calculate_fold
         && (iteration.get_folded_figure == null
           || iteration.get_folded_figure.completed !== true
@@ -665,6 +700,7 @@ export function createCodexOperationTracker({
     } else if (item.tool === "open_file" || item.tool === "export_file") {
       const path = item.arguments?.path ?? item.arguments?.file_path ?? item.arguments?.filePath;
       const resolvedPath = typeof path === "string" ? resolve(baseDirectory, path) : null;
+      sequenceEvent.path = resolvedPath;
       if (item.tool === "open_file") {
         openedPaths.push(resolvedPath);
         if (toolCallSucceeded(item)) {
@@ -673,7 +709,7 @@ export function createCodexOperationTracker({
           latestCreasePattern = null;
           const iteration = iterations[currentIterationIndex];
           if (iteration && (iteration.calculate_fold != null || iteration.get_folded_figure != null)) {
-            iteration.rollback = { completed: true, path: resolvedPath };
+            iteration.rollback = { completed: true, path: resolvedPath, event_sequence: eventSequence };
             currentIterationIndex = -1;
           }
         }
@@ -682,7 +718,7 @@ export function createCodexOperationTracker({
         const completed = toolCallSucceeded(item);
         if (completed) counts.export_file += 1;
         const iteration = iterations[currentIterationIndex];
-        if (iteration) iteration.exports.push({ completed, path: resolvedPath });
+        if (iteration) iteration.exports.push({ completed, path: resolvedPath, event_sequence: eventSequence });
       }
     } else {
       return false;
@@ -721,6 +757,7 @@ export function createCodexOperationTracker({
         action_keys: copiedIterations.map((iteration) => iteration?.add_line?.action_key ?? null),
         opened_paths: [...openedPaths],
         exported_paths: [...exportedPaths],
+        operation_sequence: operationSequence.map((entry) => ({ ...entry })),
         observed_tools: [...observedTools],
       };
     },
@@ -797,6 +834,88 @@ export function assertAllowedOrieditaPaths(snapshot, {
   if (invalidOpenPaths.length || invalidExportPaths.length) {
     throw new Error(`Orieditaが許可されていないパスを使用しました (open: ${invalidOpenPaths.join(", ") || "none"}、export: ${invalidExportPaths.join(", ") || "none"})`);
   }
+}
+
+/**
+ * Fail closed unless a one-step process proves the complete causal order from
+ * the committed starting FOLD through the accept-or-rollback decision.
+ * `operation_sequence` is built only from completed Oriedita MCP events, not
+ * from the model-authored result JSON.
+ */
+export function assertOneStepCodexEvidenceOrder(snapshot, {
+  initialFoldPath,
+  finalFoldPath,
+  accepted,
+} = {}) {
+  const expectedInitialPath = initialFoldPath ? resolve(initialFoldPath) : null;
+  const expectedFinalPath = finalFoldPath ? resolve(finalFoldPath) : null;
+  const iteration = Array.isArray(snapshot?.iterations) ? snapshot.iterations[0] : null;
+  const sequence = Array.isArray(snapshot?.operation_sequence) ? snapshot.operation_sequence : [];
+  if (!expectedInitialPath || !expectedFinalPath || typeof accepted !== "boolean" || !iteration) {
+    throw new Error("Codex一手評価の順序検証に必要な証跡がありません");
+  }
+  if (iteration.successful !== true) {
+    throw new Error("Codex一手評価のCP変更・平坦折り計算・画像確認が成功していません");
+  }
+
+  const beforeSequence = iteration?.crease_pattern_before?.event_sequence;
+  const addSequence = iteration?.add_line?.event_sequence;
+  const afterSequence = iteration?.crease_pattern_after?.event_sequence;
+  const calculateSequence = iteration?.calculate_fold?.event_sequence;
+  const imageSequence = iteration?.get_folded_figure?.event_sequence;
+  const startingOpen = sequence
+    .filter((entry) => entry?.tool === "open_file"
+      && entry.completed === true
+      && entry.path === expectedInitialPath
+      && Number.isInteger(entry.sequence)
+      && entry.sequence < beforeSequence)
+    .at(-1);
+  if (!startingOpen) {
+    throw new Error("Codex一手評価で正確な開始FOLDをopen_fileした証跡がありません");
+  }
+
+  const finalFoldEventsAfterAdd = sequence.filter((entry) =>
+    Number.isInteger(entry?.sequence)
+    && entry.sequence > addSequence
+    && entry.path === expectedFinalPath
+    && entry.completed === true
+    && (entry.tool === "open_file" || entry.tool === "export_file"));
+  const prematureDecision = finalFoldEventsAfterAdd.find((entry) => entry.sequence < imageSequence);
+  if (prematureDecision) {
+    throw new Error("Codex一手評価の採用・巻き戻し操作が折り上がり画像評価より前に実行されました");
+  }
+
+  const acceptedSave = iteration?.exports?.find((entry) =>
+    entry?.completed === true && entry.path === expectedFinalPath);
+  const rejectedRollback = iteration?.rollback?.completed === true
+    && iteration.rollback.path === expectedFinalPath
+    ? iteration.rollback
+    : null;
+  const decision = accepted ? acceptedSave : rejectedRollback;
+  const opposingDecision = accepted
+    ? finalFoldEventsAfterAdd.find((entry) => entry.tool === "open_file")
+    : finalFoldEventsAfterAdd.find((entry) => entry.tool === "export_file");
+  if (!decision || opposingDecision) {
+    throw new Error(accepted
+      ? "Codex一手評価の画像確認後に最良FOLDを保存した証跡がありません"
+      : "Codex一手評価の画像確認後に最良FOLDへ巻き戻した証跡がありません");
+  }
+
+  const orderedSequences = [
+    startingOpen.sequence,
+    beforeSequence,
+    addSequence,
+    afterSequence,
+    calculateSequence,
+    imageSequence,
+    decision.event_sequence,
+  ];
+  const strictlyOrdered = orderedSequences.every(Number.isInteger)
+    && orderedSequences.every((value, index) => index === 0 || value > orderedSequences[index - 1]);
+  if (!strictlyOrdered) {
+    throw new Error("Codex一手評価の実操作順序が open→CP前→add_line→CP後→calculate→画像→採否 と一致しません");
+  }
+  return orderedSequences;
 }
 
 export function assertCodexDecisionEvidence(steps, snapshot, {
@@ -1278,6 +1397,13 @@ export async function runCodexOrieditaLoop({
     finalFoldPath,
     startingBestScore,
   });
+  if (boundedIterations === 1) {
+    assertOneStepCodexEvidenceOrder(operationSnapshot, {
+      initialFoldPath,
+      finalFoldPath,
+      accepted: effectiveAccepted[0] === true,
+    });
+  }
   const verifiedSteps = factualSteps.map((step, index) => ({
     ...step,
     accepted: effectiveAccepted[index] === true,

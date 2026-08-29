@@ -49,7 +49,7 @@ test("application waits for a 99-point Codex and Oriedita result before showing 
   ]);
 
   assert.match(page, /API_DISCOVERY_URL/);
-  assert.match(page, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
+  assert.match(page, /raw\.githubusercontent\.com\/yuka-718\/oriai-stepwise\/refs\/heads\/runtime\/oriedita-upstream\.json/);
   assert.match(page, /application\/vnd\.github\.raw\+json/);
   assert.match(page, /candidateToFold/);
   assert.match(page, /generateCandidates/);
@@ -59,7 +59,9 @@ test("application waits for a 99-point Codex and Oriedita result before showing 
   assert.match(page, /designMode: STEPWISE_DESIGN_MODE/);
   assert.match(page, /codex_mcp_stepwise/);
   assert.match(page, /waitForApiOrigin\(\)/);
-  assert.match(page, /API_RECONNECT_ATTEMPTS = 30/);
+  assert.match(page, /API_RECONNECT_WINDOW_MS = 330_000/);
+  assert.match(page, /API_REQUEST_TIMEOUT_MS = 8_000/);
+  assert.match(page, /fetchWithTimeout/);
   assert.match(page, /生成サーバーへ接続できませんでした/);
   assert.match(page, /waitForJob\(payload\.job\.id/);
   assert.match(page, /result && hasReachedAppearanceTarget\(result\.evaluation\)/);

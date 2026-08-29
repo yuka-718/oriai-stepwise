@@ -8,8 +8,9 @@ type EvaluationLike = {
 };
 
 export function evaluatedAppearanceScore(evaluation: EvaluationLike | null | undefined) {
-  if (evaluation?.mode !== "codex_oriedita_mcp_loop"
-    || evaluation?.targetScore !== TARGET_APPEARANCE_SCORE) return null;
+  const supportedMode = evaluation?.mode === "codex_oriedita_mcp_loop"
+    || evaluation?.mode === "codex_oriedita_mcp_stepwise";
+  if (!supportedMode || evaluation?.targetScore !== TARGET_APPEARANCE_SCORE) return null;
   const value = evaluation?.appearance?.score;
   if (typeof value !== "number") return null;
   const score = Number(value);
