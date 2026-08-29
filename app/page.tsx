@@ -21,10 +21,12 @@ import {
   hashString,
 } from "./origami-engine";
 
-const API_DISCOVERY_URL = "https://api.github.com/repos/yuka-718/oriai/contents/oriedita-upstream.json?ref=runtime";
+const API_DISCOVERY_URL = process.env.NEXT_PUBLIC_ORIEDITA_DISCOVERY_URL?.trim()
+  || "https://api.github.com/repos/yuka-718/oriai-stepwise/contents/oriedita-upstream.json?ref=runtime";
 const API_RECONNECT_ATTEMPTS = 30;
 const API_RECONNECT_DELAY_MS = 2_000;
-const ACTIVE_JOB_STORAGE_KEY = "oriai:active-codex-job:v1";
+const ACTIVE_JOB_STORAGE_KEY = "oriai-stepwise:active-codex-job:v1";
+const STEPWISE_DESIGN_MODE = "codex_mcp_stepwise" as const;
 let cachedApiOrigin = "";
 
 type UploadedImage = {
@@ -67,12 +69,26 @@ type StoredActiveJob = {
   startedAt: number;
 };
 
+type JobProgress = {
+  cycle?: number;
+  maxCycles?: number | null;
+  bestScore?: number | null;
+  step?: number;
+  maxSteps?: number | null;
+  evaluationLimit?: number | null;
+  batchSize?: number | null;
+  targetScore?: number | null;
+  evaluatedNodes?: number;
+  mode?: string;
+};
+
 type LocalJob = {
   id: string;
   status: "queued" | "running" | "done" | "failed" | "cancelled";
   message: string;
   result: OrieditaResult | null;
   error: string | null;
+  progress?: JobProgress | null;
 };
 
 function fileToDataUrl(file: File) {
@@ -195,7 +211,7 @@ async function apiFetch(path: string, init?: RequestInit) {
   );
 }
 
-async function waitForJob(id: string, onMessage: (message: string) => void, signal?: AbortSignal) {
+async function waitForJob(id: string, onUpdate: (job: LocalJob) => void, signal?: AbortSignal) {
   for (let attempt = 0; ; attempt += 1) {
     if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
     await new Promise((resolve) => window.setTimeout(resolve, attempt < 3 ? 1200 : 2500));
@@ -216,7 +232,7 @@ async function waitForJob(id: string, onMessage: (message: string) => void, sign
     }
 
     if (!response.ok || !payload.job) throw new Error(payload.error ?? "処理状況を取得できませんでした");
-    onMessage(payload.job.message);
+    onUpdate(payload.job);
     if (payload.job.status === "done" && payload.job.result) {
       if (!hasReachedAppearanceTarget(payload.job.result.evaluation)) {
         throw new Error(`評価が${TARGET_APPEARANCE_SCORE}%へ到達する前に処理が終了しました`);
@@ -235,6 +251,7 @@ export default function Home() {
   const [activeStageId, setActiveStageId] = useState<FinalStateStageId>("angle-preview");
   const [runState, setRunState] = useState<"idle" | "running" | "error">("idle");
   const [message, setMessage] = useState("");
+  const [progress, setProgress] = useState<JobProgress | null>(null);
   const [elapsedSeconds, setElapsedSeconds] = useState(0);
   const [runStartedAt, setRunStartedAt] = useState<number | null>(null);
 
@@ -262,7 +279,16 @@ export default function Home() {
       setRunStartedAt(stored.startedAt);
       setRunState("running");
       setMessage(`${TARGET_APPEARANCE_SCORE}%一致までCodexとOrieditaで評価中`);
-      void waitForJob(stored.id, setMessage, controller.signal).then((completed) => {
+      setProgress({
+        step: 0,
+        bestScore: null,
+        targetScore: TARGET_APPEARANCE_SCORE,
+        mode: STEPWISE_DESIGN_MODE,
+      });
+      void waitForJob(stored.id, (job) => {
+        setMessage(job.message);
+        setProgress(job.progress ?? null);
+      }, controller.signal).then((completed) => {
         if (controller.signal.aborted) return;
         setResult(createDisplayResult(completed, stored.description));
         setRunState("idle");
@@ -289,6 +315,7 @@ export default function Home() {
     setRunState("idle");
     setRunStartedAt(null);
     setMessage("");
+    setProgress(null);
   }
 
   function handlePrompt(event: ChangeEvent<HTMLTextAreaElement>) {
@@ -324,6 +351,12 @@ export default function Home() {
     setRunStartedAt(startedAt);
     setRunState("running");
     setMessage(`${TARGET_APPEARANCE_SCORE}%一致までCodexとOrieditaで評価中`);
+    setProgress({
+      step: 0,
+      bestScore: null,
+      targetScore: TARGET_APPEARANCE_SCORE,
+      mode: STEPWISE_DESIGN_MODE,
+    });
 
     try {
       const analysis = analyzeDescription(description);
@@ -343,6 +376,7 @@ export default function Home() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
+          designMode: STEPWISE_DESIGN_MODE,
           prompt: description,
           referenceImage: image ? await fileToDataUrl(image.file) : null,
           fold: primaryFold,
@@ -356,8 +390,13 @@ export default function Home() {
       });
       const payload = await response.json() as { ok: boolean; job?: LocalJob; error?: string };
       if (!response.ok || !payload.job) throw new Error(payload.error ?? "生成を開始できませんでした");
+      setMessage(payload.job.message);
+      setProgress(payload.job.progress ?? null);
       writeStoredActiveJob({ id: payload.job.id, description, startedAt });
-      const completed = await waitForJob(payload.job.id, setMessage);
+      const completed = await waitForJob(payload.job.id, (job) => {
+        setMessage(job.message);
+        setProgress(job.progress ?? null);
+      });
       setResult(createDisplayResult(completed, description));
       setRunState("idle");
       setRunStartedAt(null);
@@ -374,6 +413,20 @@ export default function Home() {
   const activeStage = result?.finalState.stages.find((stage) => stage.id === activeStageId)
     ?? result?.finalState.stages[0]
     ?? null;
+  const completedStepCount = Math.max(0, Math.floor(Number(progress?.step) || 0));
+  const targetProgressScore = Math.max(
+    1,
+    Math.min(100, Math.floor(Number(progress?.targetScore) || TARGET_APPEARANCE_SCORE)),
+  );
+  const hasBestProgressScore = progress?.bestScore !== null && progress?.bestScore !== undefined;
+  const rawBestScore = Number(progress?.bestScore);
+  const bestProgressScore = hasBestProgressScore && Number.isFinite(rawBestScore) && rawBestScore >= 0
+    ? Math.min(100, Math.floor(rawBestScore))
+    : null;
+  const scoreBarWidth = bestProgressScore === null
+    ? 0
+    : Math.min(100, (bestProgressScore / targetProgressScore) * 100);
+  const isStepwiseProgress = progress?.mode === STEPWISE_DESIGN_MODE;
 
   return (
     <main className="generatorPage">
@@ -437,6 +490,77 @@ export default function Home() {
         </button>
         <p className="srOnly" role="status" aria-live="polite">{message}</p>
       </form>
+
+      {runState === "running" && (
+        <section className="liveProgress" aria-label="CodexとOrieditaの逐次評価状況">
+          <header className="liveProgressHeader">
+            <div>
+              <p>LIVE ORIEDITA LOOP</p>
+              <h1>折り線を一手ずつ検証中</h1>
+            </div>
+            <span>{isStepwiseProgress ? "1 ACTION / FRESH CODEX RUN" : "2D FLAT-FOLD CHECK"}</span>
+          </header>
+
+          <div className="liveProgressBody">
+            <div className="liveStatus" role="status" aria-live="polite">
+              <i aria-hidden="true" />
+              <span>{message || "Codexが次の折り線候補を準備しています"}</span>
+            </div>
+
+            <dl className="progressMetrics">
+              <div>
+                <dt>Oriedita評価済み</dt>
+                <dd>{completedStepCount}<small>手</small></dd>
+              </div>
+              <div>
+                <dt>最高点（確定済み）</dt>
+                <dd>{bestProgressScore ?? "—"}<small>{bestProgressScore === null ? "評価待ち" : "点"}</small></dd>
+              </div>
+              <div>
+                <dt>見た目の目標</dt>
+                <dd>{targetProgressScore}<small>点</small></dd>
+              </div>
+            </dl>
+
+            <div className="scoreProgress">
+              <div className="scoreProgressLabels">
+                <span>実証済み最高点</span>
+                <b>{bestProgressScore === null ? "一手目の評価待ち" : `${bestProgressScore} / ${targetProgressScore}`}</b>
+              </div>
+              <div
+                className="scoreProgressTrack"
+                role="progressbar"
+                aria-label="目標点までの進捗"
+                aria-valuemin={0}
+                aria-valuemax={targetProgressScore}
+                aria-valuenow={bestProgressScore ?? undefined}
+                aria-valuetext={bestProgressScore === null ? "一手目の評価待ち" : `${bestProgressScore}点`}
+              >
+                <span style={{ width: `${scoreBarWidth}%` }} />
+              </div>
+            </div>
+
+            <div className="progressScope" aria-label="現在の検証範囲">
+              {isStepwiseProgress && (
+                <>
+                  <b>毎手リセット</b>
+                  <span>新しいCodex実行で一手を設計・画像評価</span>
+                  <i aria-hidden="true">→</i>
+                </>
+              )}
+              <b>累積CP</b>
+              <span>折り線を1本追加</span>
+              <i aria-hidden="true">→</i>
+              <span>展開図全体をOrieditaで2D再計算</span>
+              <i aria-hidden="true">→</i>
+              <span>画像評価・採用または巻き戻し</span>
+            </div>
+            <p className="progressCaveat">
+              折られた紙の3D状態を次の一手へ保持する逐次物理シミュレーションではありません。
+            </p>
+          </div>
+        </section>
+      )}
 
       {result && hasReachedAppearanceTarget(result.evaluation) && (
         <section className="outputs" aria-label="生成結果">

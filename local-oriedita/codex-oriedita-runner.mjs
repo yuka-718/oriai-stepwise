@@ -228,6 +228,10 @@ export function codexChildEnvironment(source = process.env) {
   };
 }
 
+export function codexIsolationArgs() {
+  return ["--ephemeral", "--skip-git-repo-check", "--ignore-user-config"];
+}
+
 function clampScore(value) {
   const score = Number(value);
   return Number.isFinite(score) ? Math.max(0, Math.min(100, Math.round(score))) : 0;
@@ -939,6 +943,9 @@ export function buildCodexLoopPrompt({
   const target = normalizeTargetScore(targetScore);
   const firstGlobalIteration = offset + 1;
   const lastGlobalIteration = offset + maximumIterations;
+  const completionInstruction = maximumIterations === 1
+    ? `8. この一手の採否判断を終えたら、新しい候補を追加せず、calculate_fold と get_folded_figure も再度呼ばない。採用時は手順6で保存した最良FOLDを、不採用時は手順6で開き直した最良FOLDを現在状態とする。その現在CPを export_file で ${finalCreasePath} に保存し、指定JSONを返して直ちに終了する。次の一手は会話履歴を引き継がない別のCodexプロセスが担当する。`
+    : `8. ${target}点以上を目標に探索する。今回のバッチで届かなくても失敗を隠さず、次バッチが継続できる最良FOLDを残す。最後に最良FOLDをopen_fileで開き、calculate_fold と get_folded_figure で再確認し、export_fileで ${finalFoldPath} と ${finalCreasePath} を上書きする。`;
   return `あなたは折り紙設計を反復する実行担当です。Oriedita MCPを実際に操作し、折り線を一手ずつ追加して、毎回の折り上がり画像を自分で評価してください。
 
 最重要のツール規則:
@@ -965,7 +972,7 @@ ${safeJson(priorAttemptsSummary)}
 
 使用を許可するファイル:
 - 初期状態: ${startingPath}
-- 最終FOLD: ${finalFoldPath}
+- 最終FOLD: ${finalFoldPath}（開始時点では初期状態と同じ確定済みFOLDで初期化済み。不採用時は必ずこのパスをopen_fileで開き直す）
 - 最終展開図PNG: ${finalCreasePath}
 
 必須手順:
@@ -978,7 +985,7 @@ ${safeJson(priorAttemptsSummary)}
 5. 各回で必ず get_folded_figure を成功させ、返されたその回の画像の輪郭を目標データと比較する。部位、突起、太さ、左右バランスを画像だけから0〜100点で評価する。最終stepsには各回の実値として fold_calculation_started、fold_completed、violation_count、image_reviewed を記録する。
 6. バッチ開始時の実証済み最高点${bestScoreBeforeBatch}、または今回それ以後に採用した候補の最高点を厳密に上回った候補だけを accepted=true とし、export_file で最良FOLDとして保存する。同点または悪化した候補は必ず accepted=false とし、export_fileせず、最良FOLDをopen_fileで開き直して巻き戻す。同じ線を繰り返さない。最終JSONのscoreやbest_stepを自己申告の成功判定に使わず、各stepsの実評価値と実際の保存・巻き戻し操作を一致させる。
 7. 途中の展開図だけから完成形を想像して採点せず、必ず各回の get_folded_figure の画像を見てから判断する。
-8. ${target}点以上を目標に探索する。今回のバッチで届かなくても失敗を隠さず、次バッチが継続できる最良FOLDを残す。最後に最良FOLDをopen_fileで開き、calculate_fold と get_folded_figure で再確認し、export_fileで ${finalFoldPath} と ${finalCreasePath} を上書きする。
+${completionInstruction}
 
 制約:
 - Oriedita MCP以外でOrieditaを操作しない。
@@ -987,6 +994,7 @@ ${safeJson(priorAttemptsSummary)}
 - 構造知識は完成作品でも人間検証済み手順でもない。初期構造と設計上の参考にだけ使う。
 - 類似度は完成形画像の一致ではなく、部位数・対称性・複雑度・構造family・paramsの設計proxyである。「見た目が同じ既存作品」とは述べない。
 - これは累積展開図へ折り線を一手ずつ追加し、その時点の全展開図を2D平坦折り計算する探索である。逐次3D物理折りを行ったとは述べない。
+- 以前の会話セッションや暗黙の記憶は存在しない。上記の明示されたジョブデータ、現在の最良FOLD、以前の試行要約に含まれる重複防止情報だけを使う。
 - 最終回答は指定JSON Schemaだけに従い、stepsには実際に画像評価した各回を記録する。`;
 }
 
@@ -1053,9 +1061,7 @@ export async function runCodexOrieditaLoop({
   });
   const args = [
     "exec",
-    "--ephemeral",
-    "--skip-git-repo-check",
-    "--ignore-user-config",
+    ...codexIsolationArgs(),
     "--json",
     "--sandbox", "workspace-write",
     "-c", "approval_policy=\"never\"",
@@ -1099,6 +1105,9 @@ export async function runCodexOrieditaLoop({
 
   await appendFile(logPath, `Started ${new Date().toISOString()}\n`, { mode: 0o600 });
   const deadlineAt = Date.now() + Math.max(1, Number(timeoutMs) || 1_200_000);
+  // A one-step job maps one server scheduling turn to one fresh Codex process.
+  // Legacy multi-step batches retain the pre-operation no-tool retry.
+  const maximumAttempts = boundedIterations === 1 ? 1 : 2;
   const runAttempt = async (attemptNumber) => {
     if (signal?.aborted) {
       const error = new Error("CodexのOriedita反復処理はキャンセルされました");
@@ -1112,7 +1121,7 @@ export async function runCodexOrieditaLoop({
     await rm(outputPath, { force: true });
     await appendFile(
       logPath,
-      `=== Codex attempt ${attemptNumber}/2 started ${new Date().toISOString()} ===\n`,
+      `=== Codex attempt ${attemptNumber}/${maximumAttempts} started ${new Date().toISOString()} ===\n`,
       { mode: 0o600 },
     );
     const tracker = createCodexOperationTracker({
@@ -1232,18 +1241,18 @@ export async function runCodexOrieditaLoop({
       processError ??= error;
     }
     const snapshot = tracker.snapshot();
-    const retry = !signal?.aborted && Date.now() < deadlineAt
+    const retry = maximumAttempts > 1 && !signal?.aborted && Date.now() < deadlineAt
       && shouldRetryCodexOrieditaAttempt(snapshot, { attemptNumber });
     await appendFile(
       logPath,
-      `=== Codex attempt ${attemptNumber}/2 completed; observed Oriedita tools: ${snapshot.observed_tools.join(",") || "none"}; retry: ${retry ? "yes" : "no"} ===\n`,
+      `=== Codex attempt ${attemptNumber}/${maximumAttempts} completed; observed Oriedita tools: ${snapshot.observed_tools.join(",") || "none"}; retry: ${retry ? "yes" : "no"} ===\n`,
       { mode: 0o600 },
     );
     return { snapshot, retry, processError };
   };
 
   let operationSnapshot;
-  for (let attemptNumber = 1; attemptNumber <= 2; attemptNumber += 1) {
+  for (let attemptNumber = 1; attemptNumber <= maximumAttempts; attemptNumber += 1) {
     const attempt = await runAttempt(attemptNumber);
     operationSnapshot = attempt.snapshot;
     if (attempt.retry) {

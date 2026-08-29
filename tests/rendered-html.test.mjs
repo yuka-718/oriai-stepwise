@@ -60,7 +60,14 @@ test("connects to the dynamic Codex and Oriedita API and makes input errors visi
   assert.match(page, /生成中… \$\{elapsedSeconds\}秒/);
   assert.match(page, /resolveApiOrigin/);
   assert.match(page, /apiFetch\("\/jobs"/);
+  assert.match(page, /designMode: STEPWISE_DESIGN_MODE/);
+  assert.match(page, /codex_mcp_stepwise/);
   assert.match(page, /waitForJob/);
+  assert.match(page, /job\.progress/);
+  assert.match(page, /Oriedita評価済み/);
+  assert.match(page, /最高点（確定済み）/);
+  assert.match(page, /累積CP/);
+  assert.match(page, /逐次物理シミュレーションではありません/);
   assert.match(page, /result && hasReachedAppearanceTarget\(result\.evaluation\)/);
   assert.match(page, /TARGET_APPEARANCE_SCORE/);
   assert.doesNotMatch(page, /pipeline:\s*["']corigami_final_state_v1["']/);
@@ -71,5 +78,25 @@ test("connects to the dynamic Codex and Oriedita API and makes input errors visi
   assert.match(server, /ORI_AI_MAX_JOBS_PER_WINDOW \?\? "0"/);
   assert.match(server, /if \(maxJobsPerWindow === 0\) return;/);
   assert.match(envExample, /^ORI_AI_MAX_JOBS_PER_WINDOW=0$/m);
+  assert.match(envExample, /yuka-718\/oriai-stepwise\/runtime\/oriedita-upstream\.json/);
   assert.match(oracleDeploy, /ORI_AI_MAX_JOBS_PER_WINDOW=0/);
+});
+
+test("scopes GitHub Pages assets, metadata, discovery, and browser state to oriai-stepwise", async () => {
+  const [page, layout, pagesScript, workflow, tunnelSupervisor] = await Promise.all([
+    readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../app/layout.tsx", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/prepare-github-pages.mjs", import.meta.url), "utf8"),
+    readFile(new URL("../.github/workflows/deploy-pages.yml", import.meta.url), "utf8"),
+    readFile(new URL("../scripts/oriedita-tunnel-supervisor.mjs", import.meta.url), "utf8"),
+  ]);
+
+  assert.match(page, /yuka-718\/oriai-stepwise\/contents\/oriedita-upstream\.json/);
+  assert.match(page, /oriai-stepwise:active-codex-job:v1/);
+  assert.match(layout, /https:\/\/yuka-718\.github\.io\/oriai-stepwise\//);
+  assert.match(pagesScript, /fallbackBasePath = "\/oriai-stepwise"/);
+  assert.match(pagesScript, /GITHUB_PAGES_BASE_PATH/);
+  assert.match(workflow, /steps\.pages\.outputs\.base_path/);
+  assert.match(workflow, /steps\.pages\.outputs\.base_url/);
+  assert.match(tunnelSupervisor, /yuka-718\/oriai-stepwise/);
 });

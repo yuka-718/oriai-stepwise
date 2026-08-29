@@ -14,14 +14,20 @@ const {
   assertCodexBatchTransition,
   appendDurableJsonLine,
   cancelJob,
+  codexBatchSizeForMode,
+  codexExecutionMetadata,
   codexProcessLeaseMatches,
+  codexServiceMetadata,
   createCodexOperationSummary,
   createJobAdmissionGate,
+  isCodexDesignMode,
   loadCommittedCodexActionKeys,
   loadPersistedCodexActionHistory,
   mergeCodexBatchOperationSummary,
   persistJobState,
+  publicJob,
   restorePersistedJobs,
+  resolveDesignModeSelection,
   runCodexBatchesUntilTarget,
   runOrieditaModifiabilitySmokeTest,
   searchedStructuralPatternCount,
@@ -114,33 +120,120 @@ test("failed job creation releases its admission reservation", async () => {
   assert.equal(gate.reservations, 0);
 });
 
-function completedCodexBatch(score, iterationOffset, target = 99) {
+function completedCodexBatch(score, iterationOffset, target = 99, batchSize = 10) {
   return {
     score,
-    best_step: iterationOffset + 10,
+    best_step: iterationOffset + batchSize,
     iteration_offset: iterationOffset,
     target_score: target,
     target_reached: score >= target,
-    steps: Array.from({ length: 10 }, (_, index) => ({
+    steps: Array.from({ length: batchSize }, (_, index) => ({
       step: index + 1,
       score,
-      accepted: index === 9,
+      accepted: index === batchSize - 1,
     })),
     operation_counts: {
-      add_line: 10,
-      calculate_fold: 11,
-      get_folded_figure: 11,
+      add_line: batchSize,
+      calculate_fold: batchSize === 1 ? 1 : batchSize + 1,
+      get_folded_figure: batchSize === 1 ? 1 : batchSize + 1,
       open_file: 5,
       export_file: 3,
-      required_rollbacks: 9,
-      completed_iterations: 10,
+      required_rollbacks: Math.max(0, batchSize - 1),
+      completed_iterations: batchSize,
       action_keys: Array.from(
-        { length: 10 },
+        { length: batchSize },
         (_, index) => `MOUNTAIN:${iterationOffset + index}:0:${iterationOffset + index}:1`,
       ),
     },
   };
 }
+
+test("design jobs keep the legacy ten-step default and can request isolated one-step mode", () => {
+  const legacy = resolveDesignModeSelection({ defaultMode: "codex_mcp_loop" });
+  assert.deepEqual(legacy, {
+    mode: "codex_mcp_loop",
+    batchSize: 10,
+    unlimitedCodexMode: true,
+  });
+  const stepwise = resolveDesignModeSelection({
+    defaultMode: "codex_mcp_loop",
+    requestedMode: "codex_mcp_stepwise",
+  });
+  assert.deepEqual(stepwise, {
+    mode: "codex_mcp_stepwise",
+    batchSize: 1,
+    unlimitedCodexMode: true,
+  });
+  assert.equal(isCodexDesignMode(stepwise.mode), true);
+  assert.equal(codexBatchSizeForMode("codex_mcp_loop"), 10);
+  assert.equal(codexBatchSizeForMode("codex_mcp_stepwise"), 1);
+  assert.throws(
+    () => resolveDesignModeSelection({ requestedMode: "untrusted_mode" }),
+    (error) => error?.status === 400,
+  );
+});
+
+test("stepwise Codex metadata truthfully declares fresh context and cumulative 2D CP scope", () => {
+  const stepwise = codexExecutionMetadata("codex_mcp_stepwise");
+  assert.equal(stepwise.batchSize, 1);
+  assert.equal(stepwise.evaluationsPerCodexProcess, 1);
+  assert.equal(stepwise.freshContextPerEvaluation, true);
+  assert.equal(stepwise.conversationalSessionContinued, false);
+  assert.equal(stepwise.stateType, "cumulative_crease_pattern_prefix");
+  assert.equal(stepwise.physicalScope, "oriedita_flat_fold_2d");
+  assert.equal(stepwise.sequentialPhysicalFolding, false);
+  assert.deepEqual(stepwise.carriedState, [
+    "explicit_job_facts",
+    "current_best_fold",
+    "current_best_score",
+    "deduplicated_action_keys",
+  ]);
+
+  const legacy = codexExecutionMetadata("codex_mcp_loop");
+  assert.equal(legacy.batchSize, 10);
+  assert.equal(legacy.freshContextPerEvaluation, false);
+  const service = codexServiceMetadata("codex_mcp_loop");
+  assert.deepEqual(service.supportedModes, ["codex_mcp_loop", "codex_mcp_stepwise"]);
+  assert.equal(service.modes.codex_mcp_stepwise.batchSize, 1);
+  const stepwiseService = codexServiceMetadata("codex_mcp_stepwise");
+  assert.equal(stepwiseService.active.batchSize, 1);
+  assert.equal(stepwiseService.active.freshContextPerEvaluation, true);
+
+  const serialized = publicJob({
+    id: "11111111-1111-4111-8111-111111111111",
+    type: "design",
+    designMode: "codex_mcp_stepwise",
+    status: "queued",
+    message: "処理待ち",
+    cycle: 0,
+    step: 0,
+    maxCycles: null,
+    maxSteps: null,
+  });
+  assert.equal(serialized.progress.batchSize, 1);
+  assert.equal(serialized.progress.codexExecution.freshContextPerEvaluation, true);
+  assert.equal(serialized.progress.codexExecution.sequentialPhysicalFolding, false);
+});
+
+test("stepwise Codex scheduling completes exactly one evidenced action per batch", async () => {
+  const observed = [];
+  const result = await runCodexBatchesUntilTarget({
+    batchSize: 1,
+    maximumBatches: 1,
+    runBatch: async ({ batchNumber, startingBestScore, iterationOffset }) => {
+      observed.push({ batchNumber, startingBestScore, iterationOffset });
+      return completedCodexBatch(80, iterationOffset, 99, 1);
+    },
+  });
+  assert.deepEqual(observed, [{ batchNumber: 1, startingBestScore: -1, iterationOffset: 0 }]);
+  assert.equal(result.batchesRun, 1);
+  assert.equal(result.evaluationsCompleted, 1);
+  assert.equal(result.targetReached, false);
+
+  const summary = createCodexOperationSummary({ mode: "codex_mcp_stepwise" });
+  assert.equal(summary.batch_size, 1);
+  assert.equal(summary.execution.freshContextPerEvaluation, true);
+});
 
 test("Codex jobs have no evaluation-count limit and continue in ten-operation batches until 99", async () => {
   const scores = [42, 81, 98, 98, 99];
@@ -375,6 +468,24 @@ test("committed action history rejects a duplicate older than the retained 80 at
       loadCommittedCodexActionKeys(root, 10),
       /過去試行と重複/,
     );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("stepwise restart history validates one action key per committed process", async () => {
+  const root = await mkdtemp(join(tmpdir(), "oriai-stepwise-action-history-"));
+  try {
+    for (let batchNumber = 1; batchNumber <= 2; batchNumber += 1) {
+      const batchDirectory = join(root, "batches", String(batchNumber).padStart(6, "0"));
+      await mkdir(batchDirectory, { recursive: true });
+      await writeFile(
+        join(batchDirectory, "evaluation.json"),
+        JSON.stringify(completedCodexBatch(80 + batchNumber, batchNumber - 1, 99, 1)),
+      );
+    }
+    const history = await loadCommittedCodexActionKeys(root, 2, { batchSize: 1 });
+    assert.equal(history.size, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -677,6 +788,11 @@ test("health advertises a 99 target and no job-level evaluation limit", async ()
   assert.equal(payload.result.batchIterations, 10);
   assert.equal(payload.result.scheduling.policy, "round_robin_per_codex_batch");
   assert.equal(payload.result.scheduling.restartRecovery, true);
+  assert.deepEqual(payload.result.codex.supportedModes, ["codex_mcp_loop", "codex_mcp_stepwise"]);
+  assert.equal(payload.result.codex.active.batchSize, 10);
+  assert.equal(payload.result.codex.modes.codex_mcp_stepwise.batchSize, 1);
+  assert.equal(payload.result.codex.modes.codex_mcp_stepwise.freshContextPerEvaluation, true);
+  assert.equal(payload.result.codex.modes.codex_mcp_stepwise.sequentialPhysicalFolding, false);
 });
 
 test("final fold calculation requires both a started calculation and zero violations", () => {

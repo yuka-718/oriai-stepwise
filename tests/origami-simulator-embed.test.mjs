@@ -49,13 +49,15 @@ test("application waits for a 99-point Codex and Oriedita result before showing 
   ]);
 
   assert.match(page, /API_DISCOVERY_URL/);
-  assert.match(page, /api\.github\.com\/repos\/yuka-718\/oriai\/contents\/oriedita-upstream\.json/);
+  assert.match(page, /api\.github\.com\/repos\/yuka-718\/oriai-stepwise\/contents\/oriedita-upstream\.json/);
   assert.match(page, /application\/vnd\.github\.raw\+json/);
   assert.match(page, /candidateToFold/);
   assert.match(page, /generateCandidates/);
   assert.doesNotMatch(page, /pipeline:\s*["']corigami_final_state_v1["']/);
   assert.match(page, /createCOrigamiFinalState/);
   assert.match(page, /apiFetch\("\/jobs"/);
+  assert.match(page, /designMode: STEPWISE_DESIGN_MODE/);
+  assert.match(page, /codex_mcp_stepwise/);
   assert.match(page, /waitForApiOrigin\(\)/);
   assert.match(page, /API_RECONNECT_ATTEMPTS = 30/);
   assert.match(page, /生成サーバーへ接続できませんでした/);
@@ -68,8 +70,14 @@ test("application waits for a 99-point Codex and Oriedita result before showing 
   assert.doesNotMatch(page, /\?\? primaryFold/);
   assert.match(page, /href=\{result\.foldFile\}/);
   assert.match(page, /ACTIVE_JOB_STORAGE_KEY/);
+  assert.match(page, /oriai-stepwise:active-codex-job:v1/);
   assert.match(page, /writeStoredActiveJob\(\{ id: payload\.job\.id, description, startedAt \}\)/);
-  assert.match(page, /waitForJob\(stored\.id, setMessage, controller\.signal\)/);
+  assert.match(page, /waitForJob\(stored\.id, \(job\) =>/);
+  assert.match(page, /setProgress\(job\.progress \?\? null\)/);
+  assert.match(page, /Oriedita評価済み/);
+  assert.match(page, /最高点（確定済み）/);
+  assert.match(page, /新しいCodex実行で一手を設計・画像評価/);
+  assert.match(page, /折られた紙の3D状態を次の一手へ保持する逐次物理シミュレーションではありません/);
   assert.match(page, /src=\{result\.creaseImage\}/);
   assert.match(page, /src=\{result\.foldedImage\}/);
   assert.match(page, /<OrigamiSimulator3D foldFile=\{activeStage\.foldFile\}/);

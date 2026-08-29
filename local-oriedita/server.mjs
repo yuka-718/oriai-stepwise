@@ -67,11 +67,16 @@ const knowledgeSearchEnabled = true;
 const port = Number.parseInt(process.env.ORI_AI_LOCAL_PORT ?? "8788", 10);
 const host = process.env.ORI_AI_LOCAL_HOST ?? "127.0.0.1";
 const codexBatchIterations = 10;
+const codexStepwiseIterations = 1;
+const codexDesignModes = new Set(["codex_mcp_loop", "codex_mcp_stepwise"]);
+const requestableDesignModes = new Set(codexDesignModes);
 const evaluationLimit = null;
 const maxCycles = 10;
 const targetScore = 99;
 const configuredDesignMode = process.env.ORI_AI_DESIGN_MODE?.trim();
-const designMode = configuredDesignMode === "regeneration" || configuredDesignMode === "crease_step_search"
+const designMode = configuredDesignMode === "regeneration"
+  || configuredDesignMode === "crease_step_search"
+  || codexDesignModes.has(configuredDesignMode)
   ? configuredDesignMode
   : "codex_mcp_loop";
 const stepBranchFactor = Math.min(3, Math.max(1, Number.parseInt(process.env.ORI_AI_STEP_BRANCH_FACTOR ?? "2", 10)));
@@ -92,6 +97,80 @@ const orieditaRuntime = resolve(process.env.ORIEDITA_MCP_RUNTIME_DIR
 const connectionFile = resolve(orieditaRuntime, "connection.json");
 const orieditaLogFile = resolve(orieditaRuntime, "oriedita-api.log");
 const apiToken = process.env.ORI_AI_API_TOKEN?.trim() ?? "";
+
+export function isCodexDesignMode(mode) {
+  return codexDesignModes.has(mode);
+}
+
+export function codexBatchSizeForMode(mode) {
+  if (mode === "codex_mcp_stepwise") return codexStepwiseIterations;
+  if (mode === "codex_mcp_loop") return codexBatchIterations;
+  return null;
+}
+
+export function codexExecutionMetadata(mode) {
+  const batchSize = codexBatchSizeForMode(mode);
+  if (batchSize == null) return null;
+  const freshContextPerEvaluation = mode === "codex_mcp_stepwise";
+  return {
+    mode,
+    batchSize,
+    contextIsolation: freshContextPerEvaluation
+      ? "fresh_ephemeral_codex_process_per_evaluation"
+      : "fresh_ephemeral_codex_process_per_batch",
+    freshProcessPerBatch: true,
+    freshContextPerEvaluation,
+    evaluationsPerCodexProcess: batchSize,
+    ephemeral: true,
+    userConfigIgnored: true,
+    gitRepositoryRequired: false,
+    conversationalSessionContinued: false,
+    carriedState: [
+      "explicit_job_facts",
+      "current_best_fold",
+      "current_best_score",
+      "deduplicated_action_keys",
+    ],
+    stateType: "cumulative_crease_pattern_prefix",
+    physicalScope: "oriedita_flat_fold_2d",
+    sequentialPhysicalFolding: false,
+    sequenceFeasibility: "unverified",
+  };
+}
+
+export function codexServiceMetadata(defaultMode = designMode) {
+  return {
+    supportedModes: [...codexDesignModes],
+    defaultMode,
+    active: codexExecutionMetadata(defaultMode),
+    modes: Object.fromEntries(
+      [...codexDesignModes].map((mode) => [mode, codexExecutionMetadata(mode)]),
+    ),
+  };
+}
+
+export function resolveDesignModeSelection({
+  requestedMode = null,
+  defaultMode = designMode,
+  pipeline = null,
+} = {}) {
+  let normalizedRequestedMode = null;
+  if (requestedMode != null) {
+    if (typeof requestedMode !== "string" || !requestableDesignModes.has(requestedMode)) {
+      throw new HttpError(400, "未対応の設計モードです");
+    }
+    normalizedRequestedMode = requestedMode;
+  }
+  const mode = pipeline === "corigami_final_state_v1"
+    ? "corigami_final_state_v1"
+    : normalizedRequestedMode ?? defaultMode;
+  const batchSize = codexBatchSizeForMode(mode);
+  return {
+    mode,
+    batchSize,
+    unlimitedCodexMode: batchSize != null,
+  };
+}
 
 export function searchedStructuralPatternCount(prompt) {
   return typeof prompt === "string" && prompt.trim() ? 5_000 : 0;
@@ -316,12 +395,18 @@ export function assertCodexBatchTransition(evaluation, {
   };
 }
 
-export function createCodexOperationSummary({ requiredTargetScore = targetScore } = {}) {
+export function createCodexOperationSummary({
+  requiredTargetScore = targetScore,
+  mode = "codex_mcp_loop",
+  batchSize = codexBatchSizeForMode(mode) ?? codexBatchIterations,
+} = {}) {
   return {
     schema: "oriai-codex-unlimited-operation-summary-v1",
+    design_mode: mode,
     target_score: requiredTargetScore,
     evaluation_limit: evaluationLimit,
-    batch_size: codexBatchIterations,
+    batch_size: batchSize,
+    execution: codexExecutionMetadata(mode),
     batches_completed: 0,
     evaluations_completed: 0,
     best_score: -1,
@@ -851,7 +936,7 @@ export async function restorePersistedJobs({
       const payload = JSON.parse(await readFile(join(root, entry.name, "job-state.json"), "utf8"));
       const job = payload?.schema === "oriai-local-job-v1" ? payload.job : null;
       if (!isRestorableJob(job, root)) continue;
-      if (job.designMode === "codex_mcp_loop") {
+      if (isCodexDesignMode(job.designMode)) {
         await terminateStaleCodexProcessLease(job);
       }
       if (job.cancelRequested && job.status !== "done" && job.status !== "failed") {
@@ -914,9 +999,11 @@ function requireApiAccess(request) {
   if (!hasApiAccess(request)) throw new HttpError(401, "有効なAPIトークンが必要です");
 }
 
-function publicJob(job) {
+export function publicJob(job) {
   const hasMaxCycles = Object.hasOwn(job, "maxCycles");
   const hasMaxSteps = Object.hasOwn(job, "maxSteps");
+  const effectiveDesignMode = job.designMode ?? designMode;
+  const codexExecution = codexExecutionMetadata(effectiveDesignMode);
   return {
     id: job.id,
     type: job.type,
@@ -934,11 +1021,12 @@ function publicJob(job) {
       bestScore: job.bestScore ?? null,
       step: job.step ?? job.cycle ?? 0,
       maxSteps: hasMaxSteps ? job.maxSteps : hasMaxCycles ? job.maxCycles : maxCycles,
-      evaluationLimit: job.designMode === "codex_mcp_loop" ? evaluationLimit : (hasMaxSteps ? job.maxSteps : maxCycles),
-      batchSize: job.designMode === "codex_mcp_loop" ? codexBatchIterations : null,
-      targetScore: job.designMode === "codex_mcp_loop" ? targetScore : null,
+      evaluationLimit: codexExecution ? evaluationLimit : (hasMaxSteps ? job.maxSteps : maxCycles),
+      batchSize: codexExecution?.batchSize ?? null,
+      targetScore: codexExecution ? targetScore : null,
       evaluatedNodes: job.evaluatedNodes ?? 0,
-      mode: job.designMode ?? designMode,
+      mode: effectiveDesignMode,
+      codexExecution,
     } : null,
   };
 }
@@ -985,7 +1073,17 @@ function validateJobInput(value) {
   if (pipeline !== null && pipeline !== "corigami_final_state_v1") {
     throw new HttpError(400, "未対応の生成パイプラインです");
   }
-  return { prompt, fold, candidates, goal, referenceImage, pipeline };
+  const requestedDesignMode = value?.designMode ?? null;
+  resolveDesignModeSelection({ requestedMode: requestedDesignMode, pipeline });
+  return {
+    prompt,
+    fold,
+    candidates,
+    goal,
+    referenceImage,
+    pipeline,
+    designMode: requestedDesignMode,
+  };
 }
 
 function extensionForMimeType(mimeType) {
@@ -1006,8 +1104,12 @@ async function createJobAfterAdmission(input) {
   const preflight = validateCandidatePool(candidateFolds, goal);
   const inputFold = candidateFolds[preflight.selectedIndex];
   const finalStateMode = input.pipeline === "corigami_final_state_v1";
-  const jobDesignMode = finalStateMode ? "corigami_final_state_v1" : designMode;
-  const unlimitedCodexMode = jobDesignMode === "codex_mcp_loop";
+  const modeSelection = resolveDesignModeSelection({
+    requestedMode: input.designMode,
+    pipeline: input.pipeline,
+  });
+  const jobDesignMode = modeSelection.mode;
+  const unlimitedCodexMode = modeSelection.unlimitedCodexMode;
   const searchedPatternCount = searchedStructuralPatternCount(input.prompt);
   const shouldRunTextRetrieval = searchedPatternCount > 0 && !finalStateMode;
   const searchWorks = origamiSearchCatalog && shouldRunTextRetrieval
@@ -1104,7 +1206,7 @@ async function createJobAfterAdmission(input) {
     step: 0,
     maxCycles: finalStateMode ? 4 : unlimitedCodexMode ? null : maxCycles,
     maxSteps: finalStateMode ? 4 : unlimitedCodexMode ? null : maxCycles,
-    batchSize: unlimitedCodexMode ? codexBatchIterations : null,
+    batchSize: modeSelection.batchSize,
     evaluationLimit: unlimitedCodexMode ? evaluationLimit : (finalStateMode ? 4 : maxCycles),
     evaluatedNodes: 0,
     designMode: jobDesignMode,
@@ -2436,7 +2538,9 @@ function buildPriorAttemptsSummary(iterationRecords, operationSummary) {
   };
 }
 
-async function synchronizeCodexCheckpointLogs(directory, checkpoint) {
+async function synchronizeCodexCheckpointLogs(directory, checkpoint, {
+  batchSize = codexBatchIterations,
+} = {}) {
   if (checkpoint?.schema !== "oriai-codex-checkpoint-v1") return;
   const summary = checkpoint.operation_summary;
   const batchNumber = finiteInteger(summary?.batches_completed);
@@ -2451,11 +2555,11 @@ async function synchronizeCodexCheckpointLogs(directory, checkpoint) {
   }
   const evaluation = await readJsonIfPresent(join(directory, "batches", batchName, "evaluation.json"));
   const actionKeys = evaluation?.operation_counts?.action_keys;
-  if (!Array.isArray(actionKeys) || actionKeys.length !== codexBatchIterations) {
+  if (!Array.isArray(actionKeys) || actionKeys.length !== batchSize) {
     throw new Error("再開チェックポイントの折り線操作履歴が不足しています");
   }
   const actionRecords = actionKeys.map((actionKey, index) => ({
-    step: (batchNumber - 1) * codexBatchIterations + index + 1,
+    step: finiteInteger(batchRecord.start_step, (batchNumber - 1) * batchSize + 1) + index,
     batch: batchNumber,
     action_key: actionKey,
   }));
@@ -2523,6 +2627,9 @@ export async function loadPersistedCodexActionHistory(directory, batchesComplete
 
 async function runCodexDesignLoop(job, { signal = null } = {}) {
   throwIfJobCancelled(job, signal);
+  const batchSize = codexBatchSizeForMode(job.designMode);
+  if (batchSize == null) throw new Error(`Codex設計モードが不正です: ${job.designMode}`);
+  const executionMetadata = codexExecutionMetadata(job.designMode);
   const persistedInitialFoldPath = join(job.directory, "initial.fold");
   const initialFoldPath = await access(persistedInitialFoldPath)
     .then(() => persistedInitialFoldPath)
@@ -2544,12 +2651,27 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
     && finiteInteger(job.step) >= finiteInteger(persistedOperationSummary.evaluations_completed);
   let operationSummary = checkpoint?.schema === "oriai-codex-checkpoint-v1"
     ? checkpoint.operation_summary
-    : legacySummaryIsCommitted ? persistedOperationSummary : createCodexOperationSummary();
-  await synchronizeCodexCheckpointLogs(job.directory, checkpoint);
-  const expectedActionCount = finiteInteger(operationSummary.batches_completed) * codexBatchIterations;
+    : legacySummaryIsCommitted
+      ? persistedOperationSummary
+      : createCodexOperationSummary({ mode: job.designMode, batchSize });
+  if (finiteInteger(operationSummary?.batch_size, batchSize) !== batchSize) {
+    throw new Error("再開チェックポイントのCodex評価バッチ数が設計モードと一致しません");
+  }
+  if (operationSummary?.design_mode != null && operationSummary.design_mode !== job.designMode) {
+    throw new Error("再開チェックポイントのCodex設計モードがジョブと一致しません");
+  }
+  operationSummary = {
+    ...operationSummary,
+    design_mode: job.designMode,
+    batch_size: batchSize,
+    execution: executionMetadata,
+  };
+  await synchronizeCodexCheckpointLogs(job.directory, checkpoint, { batchSize });
+  const expectedActionCount = finiteInteger(operationSummary.batches_completed) * batchSize;
   const persistedActionHistory = await loadPersistedCodexActionHistory(
     job.directory,
     operationSummary.batches_completed,
+    { batchSize },
   );
   let attemptedActionKeys = codexActionHistoryByJob.get(job.id);
   if (!(attemptedActionKeys instanceof Set)) attemptedActionKeys = new Set();
@@ -2584,7 +2706,7 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
     startingIterationOffset: finiteInteger(operationSummary.evaluations_completed),
     startingBatchNumber: finiteInteger(operationSummary.batches_completed),
     startingBestStep: finiteInteger(operationSummary.best_step),
-    batchSize: codexBatchIterations,
+    batchSize,
     requiredTargetScore: targetScore,
     maximumBatches: 1,
     signal,
@@ -2597,7 +2719,13 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
       const batchBestFoldPath = join(batchDirectory, "best.fold");
       const batchBestCreasePath = join(batchDirectory, "best-crease.png");
       await mkdir(batchDirectory, { recursive: true, mode: 0o700 });
-      await copyFileAtomically(currentBestFoldPath, batchInitialFoldPath);
+      // Seed both logical paths from the committed best. The restricted MCP
+      // staging layer does the same, so a rejected first action always has a
+      // real rollback target and still materializes a valid best.fold.
+      await Promise.all([
+        copyFileAtomically(currentBestFoldPath, batchInitialFoldPath),
+        copyFileAtomically(currentBestFoldPath, batchBestFoldPath),
+      ]);
       batchStartingActionKeys = new Set(attemptedActionKeys);
       const incompleteBatchAttempts = inflightActionEvents
         .filter((event) => finiteInteger(event?.batch) === batchNumber)
@@ -2626,7 +2754,7 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
       job.cycle = batchNumber;
       job.bestScore = startingBestScore >= 0 ? startingBestScore : null;
       job.message = `CodexがOrieditaを操作・画像評価中（${iterationOffset}回評価済み）`;
-      const evaluation = await runCodexOrieditaLoop({
+      const runnerEvaluation = await runCodexOrieditaLoop({
         directory: batchDirectory,
         prompt: job.prompt,
         goal: job.goal,
@@ -2636,7 +2764,7 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
         referencePaths: job.referencePaths,
         referenceData: job.references,
         designBrief: completedBrief,
-        maximumIterations: codexBatchIterations,
+        maximumIterations: batchSize,
         startingBestScore,
         iterationOffset,
         targetScore,
@@ -2656,6 +2784,17 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
           job.message = `CodexがOrieditaを操作・画像評価中（${job.step}回評価）`;
         },
       });
+      const evaluation = {
+        ...runnerEvaluation,
+        design_mode: job.designMode,
+        execution: executionMetadata,
+        search_scope: {
+          stateType: executionMetadata.stateType,
+          physicalScope: executionMetadata.physicalScope,
+          sequentialPhysicalFolding: false,
+          sequenceFeasibility: "unverified",
+        },
+      };
       return {
         evaluation,
         artifactDirectory,
@@ -2680,7 +2819,7 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
       assertInitialCreasesPreserved(initialFold, batchBestFold);
       const batchActionKeys = assertNovelCodexActionKeys(evaluation?.operation_counts?.action_keys, {
         previousActionKeys: batchStartingActionKeys,
-        expectedCount: codexBatchIterations,
+        expectedCount: batchSize,
       });
       for (const actionKey of batchActionKeys) attemptedActionKeys.add(actionKey);
       inflightActionEvents = inflightActionEvents.filter((event) =>
@@ -2777,6 +2916,9 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
           current_best_crease: batchOutput.batchBestCreasePath,
           action_history_count: attemptedActionKeys.size,
           action_history_file: "action-history.jsonl",
+          design_mode: job.designMode,
+          batch_size: batchSize,
+          execution: executionMetadata,
           updated_at: new Date().toISOString(),
         }, null, 2)}\n`,
       );
@@ -2798,7 +2940,9 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
   });
 
   if (!loop.targetReached) {
-    job.message = `次の評価バッチを待機中（${loop.evaluationsCompleted}回評価済み）`;
+    job.message = job.designMode === "codex_mcp_stepwise"
+      ? `次の独立した一手評価を待機中（${loop.evaluationsCompleted}回評価済み）`
+      : `次の評価バッチを待機中（${loop.evaluationsCompleted}回評価済み）`;
     return JOB_REQUEUE;
   }
   throwIfJobCancelled(job, signal);
@@ -2851,7 +2995,9 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
     stop_reason: "target_score_reached",
     summary: lastEvaluation.summary,
     issues: lastEvaluation.issues,
-    mode: "codex_oriedita_mcp_loop",
+    mode: job.designMode === "codex_mcp_stepwise"
+      ? "codex_oriedita_mcp_stepwise"
+      : "codex_oriedita_mcp_loop",
     physical: {
       score: finalViolationCount > 0 ? 0 : 100,
       orieditaCompleted: true,
@@ -2868,7 +3014,7 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
       clearanceIsProxy: true,
     },
     evaluationLimit,
-    batchSize: codexBatchIterations,
+    batchSize,
     maxCycles: evaluationLimit,
     targetScore,
     bestCycle: loop.bestStep,
@@ -2880,13 +3026,16 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
     },
     cycles,
     steps: cycles,
+    execution: executionMetadata,
     search: {
-      stateType: "crease_pattern_prefix",
+      stateType: executionMetadata.stateType,
       actionKind: "add_crease_via_oriedita_mcp",
       evaluator: "codex_visual_review",
-      physicalScope: "oriedita_flat_fold_2d",
+      physicalScope: executionMetadata.physicalScope,
       sequentialPhysicalFolding: false,
       sequenceFeasibility: "unverified",
+      freshContextPerEvaluation: executionMetadata.freshContextPerEvaluation,
+      conversationalSessionContinued: false,
     },
   };
   await Promise.all([
@@ -2900,11 +3049,14 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
         stopReason: "target_score_reached",
         targetScore,
         scheduling: {
-          policy: "round_robin_per_codex_batch",
-          batchEvaluations: codexBatchIterations,
+          policy: job.designMode === "codex_mcp_stepwise"
+            ? "round_robin_per_fresh_codex_evaluation"
+            : "round_robin_per_codex_batch",
+          batchEvaluations: batchSize,
           cancelEndpoint: "POST /jobs/{jobId}/cancel",
           restartRecovery: true,
         },
+        execution: executionMetadata,
         evaluationLimit,
         bestScore: loop.bestScore,
         bestStep: loop.bestStep,
@@ -2929,7 +3081,7 @@ async function runCodexDesignLoop(job, { signal = null } = {}) {
 
 async function runDesignLoop(job, { signal = null } = {}) {
   if (job.designMode === "corigami_final_state_v1") return runCOrigamiFinalState(job);
-  if (job.designMode === "codex_mcp_loop") return runCodexDesignLoop(job, { signal });
+  if (isCodexDesignMode(job.designMode)) return runCodexDesignLoop(job, { signal });
   if (job.knowledgeMatch || job.designMode === "regeneration") return runRegenerationLoop(job);
   return runStepDesignLoop(job);
 }
@@ -3039,7 +3191,7 @@ async function executeJob(job) {
     ? "Orieditaで折り上がりを計算中"
     : job.designMode === "corigami_final_state_v1"
       ? "第1段階: 展開図と2D折り上がりを検証中"
-    : job.designMode === "codex_mcp_loop"
+    : isCodexDesignMode(job.designMode)
       ? "CodexがOrieditaを一手ずつ操作・評価中"
       : job.designMode === "crease_step_search"
       ? "折り線を一手ずつ追加し、OrieditaとGroqで評価中"
@@ -3142,6 +3294,8 @@ async function handle(request, response) {
     return;
   }
   if (request.method === "GET" && url.pathname === "/health") {
+    const codexService = codexServiceMetadata(designMode);
+    const activeCodex = codexService.active;
     send(response, 200, {
       ok: true,
       result: {
@@ -3150,16 +3304,19 @@ async function handle(request, response) {
         queued: queue.length,
         maxIterations: evaluationLimit,
         evaluationLimit,
-        batchIterations: codexBatchIterations,
-        maxCycles: designMode === "codex_mcp_loop" ? evaluationLimit : maxCycles,
+        batchIterations: activeCodex?.batchSize ?? codexBatchIterations,
+        maxCycles: activeCodex ? evaluationLimit : maxCycles,
         targetScore,
         scheduling: {
-          policy: "round_robin_per_codex_batch",
-          batchEvaluations: codexBatchIterations,
+          policy: designMode === "codex_mcp_stepwise"
+            ? "round_robin_per_fresh_codex_evaluation"
+            : "round_robin_per_codex_batch",
+          batchEvaluations: activeCodex?.batchSize ?? codexBatchIterations,
           cancelEndpoint: "POST /jobs/{jobId}/cancel",
           restartRecovery: true,
         },
         designMode,
+        codex: codexService,
         stepSearch: { maxSteps: maxCycles, branchFactor: stepBranchFactor, beamWidth: stepBeamWidth },
         knowledgeSearch: knowledgeSearchEnabled,
         rag: {
@@ -3169,7 +3326,7 @@ async function handle(request, response) {
           referenceImageMaximum: 8,
           finishedWorkSubstitution: false,
         },
-        evaluator: designMode === "codex_mcp_loop"
+        evaluator: isCodexDesignMode(designMode)
           ? { provider: "codex", model: "Codex CLI", configured: true }
           : { provider: "groq", model: groqModel, configured: Boolean(groqApiKey) },
       },
@@ -3177,6 +3334,8 @@ async function handle(request, response) {
     return;
   }
   if (request.method === "GET" && url.pathname === "/v1/oriedita/health") {
+    const codexService = codexServiceMetadata(designMode);
+    const activeCodex = codexService.active;
     send(response, 200, {
       ok: true,
       result: {
@@ -3186,17 +3345,20 @@ async function handle(request, response) {
         busy: Boolean(activeJobId),
         queued: queue.length,
         authentication: apiToken ? "bearer" : "none",
-        maxCycles: designMode === "codex_mcp_loop" ? evaluationLimit : maxCycles,
+        maxCycles: activeCodex ? evaluationLimit : maxCycles,
         evaluationLimit,
-        batchIterations: codexBatchIterations,
+        batchIterations: activeCodex?.batchSize ?? codexBatchIterations,
         targetScore,
         scheduling: {
-          policy: "round_robin_per_codex_batch",
-          batchEvaluations: codexBatchIterations,
+          policy: designMode === "codex_mcp_stepwise"
+            ? "round_robin_per_fresh_codex_evaluation"
+            : "round_robin_per_codex_batch",
+          batchEvaluations: activeCodex?.batchSize ?? codexBatchIterations,
           cancelEndpoint: "POST /jobs/{jobId}/cancel",
           restartRecovery: true,
         },
         designMode,
+        codex: codexService,
         stepSearch: { maxSteps: maxCycles, branchFactor: stepBranchFactor, beamWidth: stepBeamWidth },
         knowledgeSearch: knowledgeSearchEnabled,
         rag: {
@@ -3206,7 +3368,7 @@ async function handle(request, response) {
           referenceImageMaximum: 8,
           finishedWorkSubstitution: false,
         },
-        evaluator: designMode === "codex_mcp_loop"
+        evaluator: isCodexDesignMode(designMode)
           ? { provider: "codex", model: "Codex CLI", configured: true }
           : { provider: "groq", model: groqModel, configured: Boolean(groqApiKey) },
         oriedita: await inspectOriedita(),

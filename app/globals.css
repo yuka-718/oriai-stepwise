@@ -121,6 +121,54 @@ a { color: inherit; text-decoration: none; }
 .generate:active { transform: scale(.99); }
 .generate:disabled { cursor: wait; background: #6f87dd; }
 
+.liveProgress {
+  margin-top: 20px;
+  overflow: hidden;
+  border: 1px solid var(--line);
+  border-top: 7px solid var(--cyan);
+  border-radius: 14px;
+  background: var(--surface);
+  box-shadow: var(--shadow);
+}
+.liveProgressHeader {
+  min-height: 74px;
+  padding: 17px 23px;
+  border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+}
+.liveProgressHeader p { margin: 0 0 6px; color: #087d91; font: 850 8px/1 ui-monospace, "SFMono-Regular", monospace; letter-spacing: .12em; }
+.liveProgressHeader h1 { margin: 0; font-size: clamp(19px, 2vw, 27px); letter-spacing: -.04em; }
+.liveProgressHeader > span { flex: 0 0 auto; padding: 7px 9px; border-radius: 4px; background: rgba(18, 184, 210, .12); color: #087d91; font: 900 8px/1 ui-monospace, "SFMono-Regular", monospace; letter-spacing: .08em; }
+
+.liveProgressBody { padding: 21px 23px 18px; }
+.liveStatus { min-height: 44px; padding: 11px 14px; border-radius: 7px; background: #f4fbfc; display: flex; align-items: center; gap: 11px; color: #285261; font-size: 11px; font-weight: 750; }
+.liveStatus i { width: 10px; height: 10px; flex: 0 0 auto; border-radius: 50%; background: var(--cyan); box-shadow: 0 0 0 0 rgba(18, 184, 210, .38); animation: livePulse 1.8s ease-out infinite; }
+@keyframes livePulse {
+  0% { box-shadow: 0 0 0 0 rgba(18, 184, 210, .38); }
+  70%, 100% { box-shadow: 0 0 0 9px rgba(18, 184, 210, 0); }
+}
+
+.progressMetrics { margin: 14px 0 0; display: grid; grid-template-columns: repeat(3, 1fr); overflow: hidden; border: 1px solid var(--line); border-radius: 7px; }
+.progressMetrics div { min-width: 0; padding: 14px 15px 13px; }
+.progressMetrics div + div { border-left: 1px solid var(--line); }
+.progressMetrics dt { margin-bottom: 8px; color: var(--muted); font: 800 8px/1 ui-monospace, "SFMono-Regular", monospace; letter-spacing: .05em; }
+.progressMetrics dd { margin: 0; font-size: 24px; font-weight: 900; letter-spacing: -.04em; }
+.progressMetrics small { margin-left: 6px; color: var(--muted); font-size: 9px; font-weight: 750; letter-spacing: 0; }
+
+.scoreProgress { margin-top: 16px; }
+.scoreProgressLabels { margin-bottom: 7px; display: flex; align-items: center; justify-content: space-between; gap: 12px; color: var(--muted); font: 800 8px/1 ui-monospace, "SFMono-Regular", monospace; letter-spacing: .06em; }
+.scoreProgressLabels b { color: var(--ink); font-size: 9px; }
+.scoreProgressTrack { height: 8px; overflow: hidden; border-radius: 999px; background: #e7ebf2; }
+.scoreProgressTrack span { display: block; width: 0; height: 100%; border-radius: inherit; background: linear-gradient(90deg, var(--blue), var(--cyan), var(--green)); transition: width .35s ease; }
+
+.progressScope { margin-top: 17px; padding: 12px 14px; border: 1px solid rgba(36, 87, 255, .16); border-radius: 7px; background: #f6f8ff; display: flex; align-items: center; gap: 9px; color: var(--muted); font-size: 9px; line-height: 1.45; }
+.progressScope b { flex: 0 0 auto; padding: 6px 8px; border-radius: 4px; background: var(--blue); color: #fff; font: 900 8px/1 ui-monospace, "SFMono-Regular", monospace; letter-spacing: .08em; }
+.progressScope i { color: var(--blue); font-style: normal; font-size: 14px; }
+.progressCaveat { margin: 9px 1px 0; color: var(--muted); font-size: 9px; line-height: 1.55; }
+
 .outputs { display: block; margin-top: 22px; }
 .phaseOneGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
 .outputPanel { min-width: 0; min-height: 0; margin: 0; overflow: hidden; border: 1px solid var(--line); border-radius: 14px; background: var(--surface); box-shadow: var(--shadow); }
@@ -287,6 +335,12 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
   .uploadField { border-bottom: 1px solid var(--line); }
   .uploadField > label { min-height: 122px; flex-direction: row; }
   .uploadField img { width: 76px; height: 68px; }
+  .liveProgress { border-radius: 10px; }
+  .liveProgressHeader { align-items: flex-start; flex-direction: column; }
+  .progressMetrics { grid-template-columns: 1fr; }
+  .progressMetrics div + div { border-top: 1px solid var(--line); border-left: 0; }
+  .progressScope { align-items: flex-start; flex-direction: column; }
+  .progressScope i { transform: rotate(90deg); }
   .outputPanel > h1, .outputTitle, .modelTitle, .foldedTitle { height: 52px; }
   .creaseStage, .modelStage, .folded2dStage { height: 92vw; padding: 15px; }
   .creasePattern, .orieditaCrease { border-width: 5px; }
@@ -303,5 +357,5 @@ button:focus-visible, a:focus-visible, textarea:focus-visible, input:focus-visib
 }
 
 @media (prefers-reduced-motion: reduce) {
-  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; }
+  *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation: none !important; }
 }

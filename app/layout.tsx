@@ -1,7 +1,10 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
 
-const publicUrl = "https://yuka-718.github.io/oriai/";
+const configuredPublicUrl = process.env.NEXT_PUBLIC_SITE_URL?.trim();
+const publicUrl = configuredPublicUrl
+  ? `${configuredPublicUrl.replace(/\/+$/, "")}/`
+  : "https://yuka-718.github.io/oriai-stepwise/";
 
 export const metadata: Metadata = {
   metadataBase: new URL(publicUrl),

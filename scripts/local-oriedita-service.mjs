@@ -97,6 +97,10 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
     <string>high</string>
     <key>ORI_AI_TRUST_PROXY</key>
     <string>1</string>
+    <key>ORI_AI_MAX_JOBS_PER_WINDOW</key>
+    <string>3</string>
+    <key>ORI_AI_RATE_WINDOW_MS</key>
+    <string>21600000</string>
     <key>ORIEDITA_MCP_SERVER</key>
     <string>${xml(join(sourceMcp, "server.mjs"))}</string>
     <key>ORIEDITA_JAR</key>

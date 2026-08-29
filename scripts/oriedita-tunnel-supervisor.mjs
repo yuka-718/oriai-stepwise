@@ -9,7 +9,8 @@ const localtunnel = process.env.ORI_AI_LOCALTUNNEL ?? fileURLToPath(new URL("../
 const localtunnelSubdomain = process.env.ORI_AI_LOCALTUNNEL_SUBDOMAIN ?? "oriai-ito-pj-2026";
 const provider = process.env.ORI_AI_TUNNEL_PROVIDER ?? "localhostrun";
 const gh = process.env.ORI_AI_GH ?? "/opt/homebrew/bin/gh";
-const registryRepo = process.env.ORI_AI_TUNNEL_REGISTRY_REPO ?? "yuka-718/oriai";
+const registryRepo = process.env.ORI_AI_TUNNEL_REGISTRY_REPO ?? "yuka-718/oriai-stepwise";
+const registryMirrorRepos = process.env.ORI_AI_TUNNEL_REGISTRY_MIRROR_REPOS ?? "";
 const registryBranch = process.env.ORI_AI_TUNNEL_REGISTRY_BRANCH ?? "runtime";
 const registryPath = process.env.ORI_AI_TUNNEL_REGISTRY_PATH ?? "oriedita-upstream.json";
 const localHealth = process.env.ORI_AI_LOCAL_HEALTH ?? "http://127.0.0.1:8788/health";
@@ -28,22 +29,50 @@ async function ghJson(argumentsList, input = null) {
   return stdout.trim() ? JSON.parse(stdout) : null;
 }
 
-export async function publishTunnelUrl(url) {
-  const endpoint = `repos/${registryRepo}/contents/${registryPath}`;
+export function tunnelRegistryRepos(primaryRepo = registryRepo, mirrorRepos = registryMirrorRepos) {
+  const repositories = [primaryRepo, ...String(mirrorRepos ?? "").split(",")]
+    .map((repository) => String(repository ?? "").trim())
+    .filter(Boolean);
+  const seen = new Set();
+  return repositories.filter((repository) => {
+    const key = repository.toLowerCase();
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+async function publishTunnelUrlToRegistry(repository, document, githubJson) {
+  const endpoint = `repos/${repository}/contents/${registryPath}`;
   let existing = null;
   try {
-    existing = await ghJson(["api", `${endpoint}?ref=${registryBranch}`]);
+    existing = await githubJson(["api", `${endpoint}?ref=${registryBranch}`]);
   } catch {
     // The first write creates the registry file on the existing runtime branch.
   }
-  const document = `${JSON.stringify({ url, updatedAt: new Date().toISOString() }, null, 2)}\n`;
   const payload = {
     message: "Update ORIAI runtime tunnel",
     branch: registryBranch,
     content: Buffer.from(document).toString("base64"),
     ...(typeof existing?.sha === "string" ? { sha: existing.sha } : {}),
   };
-  await ghJson(["api", "--method", "PUT", endpoint, "--input", "-"], payload);
+  await githubJson(["api", "--method", "PUT", endpoint, "--input", "-"], payload);
+}
+
+export async function publishTunnelUrlToRegistries(
+  url,
+  repositories,
+  githubJson,
+  updatedAt = new Date().toISOString(),
+) {
+  const document = `${JSON.stringify({ url, updatedAt }, null, 2)}\n`;
+  await Promise.all(
+    repositories.map((repository) => publishTunnelUrlToRegistry(repository, document, githubJson)),
+  );
+}
+
+export async function publishTunnelUrl(url) {
+  await publishTunnelUrlToRegistries(url, tunnelRegistryRepos(), ghJson);
 }
 
 async function healthy(url, timeoutMs = 10_000) {

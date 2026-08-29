@@ -2,13 +2,23 @@ import { access, readFile, readdir, writeFile } from "node:fs/promises";
 import { extname, join, resolve } from "node:path";
 
 const outputRoot = resolve("dist/client");
-const basePath = "/oriai";
+const fallbackBasePath = "/oriai-stepwise";
 const textExtensions = new Set([".html", ".rsc", ".js", ".css", ".json", ""]);
 const rootPaths = [
   "/_next/",
   "/favicon.png",
   "/og-studio.png",
 ];
+
+function normalizeBasePath(value) {
+  const trimmed = String(value ?? "").trim();
+  if (!trimmed || trimmed === "/") return "";
+  return `/${trimmed.replace(/^\/+|\/+$/g, "")}`;
+}
+
+const basePath = normalizeBasePath(
+  process.env.GITHUB_PAGES_BASE_PATH ?? fallbackBasePath,
+);
 
 async function listFiles(directory) {
   const entries = await readdir(directory, { withFileTypes: true });
@@ -52,7 +62,7 @@ const indexHtml = await readFile(join(outputRoot, "index.html"), "utf8");
 if (indexHtml.includes('"/_next/') || indexHtml.includes('href="/favicon.png')) {
   throw new Error("GitHub Pages build still contains an unprefixed root asset URL");
 }
-if (indexHtml.includes(`${basePath}${basePath}`)) {
+if (basePath && indexHtml.includes(`${basePath}${basePath}`)) {
   throw new Error("GitHub Pages build contains a duplicated base path");
 }
-console.log(`Prepared GitHub Pages output for ${basePath}/`);
+console.log(`Prepared GitHub Pages output for ${basePath ? `${basePath}/` : "/"}`);

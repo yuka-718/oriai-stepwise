@@ -14,6 +14,7 @@ import {
   buildCodexLoopPrompt,
   codexActionKey,
   codexChildEnvironment,
+  codexIsolationArgs,
   createSecureOrieditaStaging,
   createCodexOperationTracker,
   deriveVerifiedCodexBatchOutcome,
@@ -160,6 +161,42 @@ test("Codex loop prompt requires one crease, fold calculation, image review when
   assert.match(prompt, /最初のツール呼び出しは必ず oriedita\.get_status/);
   assert.match(prompt, /list_mcp_resources、list_mcp_resource_templates、read_mcp_resource.*呼んではいけません/);
   assert.match(prompt, /リソース一覧が空でもOrieditaツールが利用できないとは判断しない/);
+});
+
+test("stepwise prompt performs one action and decision, then exits for a fresh process", () => {
+  const prompt = buildCodexLoopPrompt({
+    prompt: "翼を広げた鶴",
+    goal: { parts: [{ label: "翼" }] },
+    rootPath: "/tmp/job/root.fold",
+    finalFoldPath: "/tmp/job/final.fold",
+    finalCreasePath: "/tmp/job/final.png",
+    maximumIterations: 1,
+    startingBestScore: 74,
+    iterationOffset: 20,
+    targetScore: 99,
+    priorAttemptsSummary: { action_keys: ["MOUNTAIN:a:b"] },
+  });
+
+  assert.match(prompt, /候補の追加と評価をちょうど1回/);
+  assert.match(prompt, /一回につき add_line をちょうど1回/);
+  assert.match(prompt, /この一手の採否判断を終えたら/);
+  assert.match(prompt, /calculate_fold と get_folded_figure も再度呼ばない/);
+  assert.match(prompt, /会話履歴を引き継がない別のCodexプロセス/);
+  assert.match(prompt, /以前の会話セッションや暗黙の記憶は存在しない/);
+  assert.match(prompt, /累積展開図/);
+  assert.match(prompt, /逐次3D物理折りを行ったとは述べない/);
+  assert.doesNotMatch(prompt, /最後に最良FOLDをopen_fileで開き、calculate_fold/);
+});
+
+test("Codex result schema accepts one through ten evidenced steps", async () => {
+  const schema = JSON.parse(await readFile(
+    new URL("../local-oriedita/codex-result.schema.json", import.meta.url),
+    "utf8",
+  ));
+  assert.equal(schema.properties.iterations.minimum, 1);
+  assert.equal(schema.properties.iterations.maximum, 10);
+  assert.equal(schema.properties.steps.minItems, 1);
+  assert.equal(schema.properties.steps.maxItems, 10);
 });
 
 test("Codex retry is eligible only after a completed first attempt with no Oriedita call", () => {
@@ -398,6 +435,46 @@ test("JSONL tracker fails closed when add_line does not change the full CP hash"
   assert.equal(snapshot.iterations[0].crease_pattern_after.changed, false);
   assert.equal(snapshot.completed_iterations, 0);
   assert.throws(() => assertCodexOperationSnapshot(snapshot, 1), /失敗 step: 1/);
+});
+
+test("one-step evidence contains exactly one CP mutation, fold result, image review, and decision", () => {
+  const tracker = createCodexOperationTracker({ maximumIterations: 1 });
+  ingestSuccessfulIteration(tracker, 0);
+  tracker.ingestLine(mcpEvent("export_file", { arguments: { path: "/tmp/job/final.fold" } }));
+  const snapshot = tracker.snapshot();
+
+  assert.equal(snapshot.counts.add_line, 1);
+  assert.equal(snapshot.completed_iterations, 1);
+  assert.equal(snapshot.iterations.length, 1);
+  assert.equal(snapshot.iterations[0].crease_pattern_after.changed, true);
+  assert.equal(snapshot.iterations[0].calculate_fold.started, true);
+  assert.equal(snapshot.iterations[0].get_folded_figure.image_present, true);
+  assert.doesNotThrow(() => assertCodexOperationSnapshot(snapshot, 1));
+  assert.deepEqual(assertCodexDecisionEvidence([
+    { step: 1, score: 80, accepted: true },
+  ], snapshot, {
+    finalFoldPath: "/tmp/job/final.fold",
+    startingBestScore: 79,
+  }), [true]);
+});
+
+test("a rejected first step rolls back to the preseeded committed FOLD", () => {
+  const tracker = createCodexOperationTracker({ maximumIterations: 1 });
+  ingestSuccessfulIteration(tracker, 0);
+  tracker.ingestLine(mcpEvent("open_file", { arguments: { path: "/tmp/job/best.fold" } }));
+  tracker.ingestLine(mcpEvent("export_file", { arguments: { path: "/tmp/job/best-crease.png" } }));
+  const snapshot = tracker.snapshot();
+
+  assert.equal(snapshot.counts.add_line, 1);
+  assert.equal(snapshot.completed_iterations, 1);
+  assert.equal(snapshot.iterations[0].rollback.completed, true);
+  assert.equal(snapshot.iterations[0].rollback.path, "/tmp/job/best.fold");
+  assert.deepEqual(assertCodexDecisionEvidence([
+    { step: 1, score: 79, accepted: false },
+  ], snapshot, {
+    finalFoldPath: "/tmp/job/best.fold",
+    startingBestScore: 80,
+  }), [false]);
 });
 
 test("action callbacks persist an inflight key before recording verified CP-change evidence", async () => {
@@ -679,6 +756,13 @@ test("saving a tie with the previous batch best is rejected as contradictory evi
 
 test("Codex exec uses JSONL with isolated stdout parsing and noninteractive safe flags", async () => {
   const source = await readFile(new URL("../local-oriedita/codex-oriedita-runner.mjs", import.meta.url), "utf8");
+  assert.deepEqual(codexIsolationArgs(), [
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--ignore-user-config",
+  ]);
+  assert.match(source, /\.\.\.codexIsolationArgs\(\)/);
+  assert.match(source, /const maximumAttempts = boundedIterations === 1 \? 1 : 2/);
   assert.match(source, /"--json"/);
   assert.match(source, /"--sandbox", "workspace-write"/);
   assert.match(source, /approval_policy=\\"never\\"/);
