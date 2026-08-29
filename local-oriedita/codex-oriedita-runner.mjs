@@ -1095,8 +1095,8 @@ export async function runCodexOrieditaLoop({
     "-c", `mcp_servers.oriedita.env.ORIAI_ORIEDITA_PATH_MAPPINGS=${JSON.stringify(JSON.stringify(staging.pathMappings))}`,
     ...(actionWalPath ? [
       "-c", `mcp_servers.oriedita.env.ORIAI_ORIEDITA_ACTION_WAL_PATH=${JSON.stringify(resolve(actionWalPath))}`,
-      "-c", `mcp_servers.oriedita.env.ORIAI_ORIEDITA_ACTION_BATCH=${JSON.stringify(Math.floor(iterationOffset / boundedIterations) + 1)}`,
-      "-c", `mcp_servers.oriedita.env.ORIAI_ORIEDITA_ACTION_ITERATION_OFFSET=${JSON.stringify(iterationOffset)}`,
+      "-c", `mcp_servers.oriedita.env.ORIAI_ORIEDITA_ACTION_BATCH=${JSON.stringify(String(Math.floor(iterationOffset / boundedIterations) + 1))}`,
+      "-c", `mcp_servers.oriedita.env.ORIAI_ORIEDITA_ACTION_ITERATION_OFFSET=${JSON.stringify(String(iterationOffset))}`,
     ] : []),
     ...boundedReferences.flatMap((path) => ["--image", path]),
     "--",

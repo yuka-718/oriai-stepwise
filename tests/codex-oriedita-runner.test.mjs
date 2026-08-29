@@ -763,6 +763,8 @@ test("Codex exec uses JSONL with isolated stdout parsing and noninteractive safe
   ]);
   assert.match(source, /\.\.\.codexIsolationArgs\(\)/);
   assert.match(source, /const maximumAttempts = boundedIterations === 1 \? 1 : 2/);
+  assert.match(source, /ORIAI_ORIEDITA_ACTION_BATCH=\$\{JSON\.stringify\(String\(/);
+  assert.match(source, /ORIAI_ORIEDITA_ACTION_ITERATION_OFFSET=\$\{JSON\.stringify\(String\(/);
   assert.match(source, /"--json"/);
   assert.match(source, /"--sandbox", "workspace-write"/);
   assert.match(source, /approval_policy=\\"never\\"/);

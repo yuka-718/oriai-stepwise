@@ -111,7 +111,7 @@ const plist = `<?xml version="1.0" encoding="UTF-8"?>
   <key>KeepAlive</key>
   <true/>
   <key>ProcessType</key>
-  <string>Background</string>
+  <string>Interactive</string>
   <key>StandardOutPath</key>
   <string>${xml(join(logs, "server.log"))}</string>
   <key>StandardErrorPath</key>

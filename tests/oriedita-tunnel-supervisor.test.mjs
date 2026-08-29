@@ -92,4 +92,5 @@ test("installed services keep legacy design mode and publish a rate-limited shar
   assert.match(localService, /ORI_AI_DESIGN_MODE<\/key>\s*<string>codex_mcp_loop<\/string>/);
   assert.match(localService, /ORI_AI_MAX_JOBS_PER_WINDOW<\/key>\s*<string>3<\/string>/);
   assert.match(localService, /ORI_AI_RATE_WINDOW_MS<\/key>\s*<string>21600000<\/string>/);
+  assert.match(localService, /ProcessType<\/key>\s*<string>Interactive<\/string>/);
 });

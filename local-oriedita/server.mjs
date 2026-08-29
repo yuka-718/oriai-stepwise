@@ -48,6 +48,11 @@ import {
   runCodexOrieditaLoop,
 } from "./codex-oriedita-runner.mjs";
 import {
+  observeChildProcess,
+  parseOrieditaStartupTimeoutMs,
+  terminateObservedChild,
+} from "./process-lifecycle.mjs";
+import {
   ApiInputError,
   createOpenApiDocument,
   ORIEDITA_API_VERSION,
@@ -82,6 +87,9 @@ const designMode = configuredDesignMode === "regeneration"
 const stepBranchFactor = Math.min(3, Math.max(1, Number.parseInt(process.env.ORI_AI_STEP_BRANCH_FACTOR ?? "2", 10)));
 const stepBeamWidth = Math.min(2, Math.max(1, Number.parseInt(process.env.ORI_AI_STEP_BEAM_WIDTH ?? "1", 10)));
 const jobTimeoutMs = Math.max(60_000, Number.parseInt(process.env.ORI_AI_JOB_TIMEOUT_MS ?? "1200000", 10));
+const orieditaStartupTimeoutMs = parseOrieditaStartupTimeoutMs(
+  process.env.ORI_AI_ORIEDITA_STARTUP_TIMEOUT_MS,
+);
 const rateWindowMs = Math.max(60_000, Number.parseInt(process.env.ORI_AI_RATE_WINDOW_MS ?? "21600000", 10));
 const maxJobsPerWindow = Math.max(0, Number.parseInt(process.env.ORI_AI_MAX_JOBS_PER_WINDOW ?? "0", 10));
 const trustProxy = process.env.ORI_AI_TRUST_PROXY === "1";
@@ -1339,8 +1347,10 @@ async function launchOriedita() {
   await rm(connectionFile, { force: true });
   const token = randomBytes(32).toString("hex");
   const log = await open(orieditaLogFile, "a", 0o600);
+  let child;
+  let observation;
   try {
-    const child = spawn(orieditaJava, ["-jar", orieditaJar], {
+    child = spawn(orieditaJava, ["-jar", orieditaJar], {
       cwd: projectRoot,
       detached: true,
       env: {
@@ -1350,18 +1360,60 @@ async function launchOriedita() {
       },
       stdio: ["ignore", log.fd, log.fd],
     });
+    observation = observeChildProcess(child);
     child.unref();
   } finally {
     await log.close();
   }
 
-  const deadline = Date.now() + 30_000;
+  const terminateLaunch = async () => {
+    if (!observation) return;
+    await terminateObservedChild(child, observation, {
+      sendSignal: (signal) => {
+        if (process.platform === "win32") return child.kill(signal);
+        try {
+          process.kill(-child.pid, signal);
+          return true;
+        } catch (error) {
+          if (error?.code === "ESRCH") return false;
+          throw error;
+        }
+      },
+    });
+  };
+  const removeMatchingConnection = async () => {
+    const lateConnection = await readConnection();
+    if (lateConnection?.token === token) await rm(connectionFile, { force: true });
+  };
+  const throwIfLaunchTerminated = async () => {
+    const state = observation?.status();
+    if (!state) return;
+    await removeMatchingConnection();
+    if (state.error) {
+      throw new Error(
+        `Orieditaを起動できませんでした (${state.error.message})。${orieditaLogFile} を確認してください`,
+        { cause: state.error },
+      );
+    }
+    const outcome = state.signalCode ? `signal ${state.signalCode}` : `exit ${state.exitCode}`;
+    throw new Error(`Orieditaが起動中に終了しました (${outcome})。${orieditaLogFile} を確認してください`);
+  };
+
+  const deadline = Date.now() + orieditaStartupTimeoutMs;
   while (Date.now() < deadline) {
     const connection = await readConnection();
     if (connection?.token === token && await healthyConnection(connection)) return connection;
+    await throwIfLaunchTerminated();
     await new Promise((resolveWait) => setTimeout(resolveWait, 150));
   }
-  throw new Error(`Orieditaを起動できませんでした。${orieditaLogFile} を確認してください`);
+  try {
+    await terminateLaunch();
+  } finally {
+    await removeMatchingConnection();
+  }
+  throw new Error(
+    `Orieditaを${Math.ceil(orieditaStartupTimeoutMs / 1000)}秒以内に起動できませんでした。${orieditaLogFile} を確認してください`,
+  );
 }
 
 async function ensureOriedita() {
